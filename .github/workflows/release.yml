@@ -145,7 +145,8 @@ jobs:
           for package in client astro cli; do
             name="@loomup/${package}"
             tarball="./npm-tarballs/loomup-${package}-${VERSION}.tgz"
-            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+            version_url="https://registry.npmjs.org/%40loomup%2F${package}/${VERSION}"
+            if curl --fail --silent --output /dev/null "$version_url"; then
               echo "${name}@${VERSION} already exists; skipping publication."
             else
               npm publish "$tarball" --access public --tag "$PUBLISH_TAG" --provenance
@@ -155,11 +156,12 @@ jobs:
       - name: Verify registry artifacts
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          NPM_CONFIG_USERCONFIG: /dev/null
         run: |
           for attempt in $(seq 1 12); do
-            if npm view "@loomup/client@${VERSION}" version >/dev/null 2>&1 \
-              && npm view "@loomup/astro@${VERSION}" version >/dev/null 2>&1 \
-              && npm view "@loomup/cli@${VERSION}" version >/dev/null 2>&1; then
+            if curl --fail --silent --output /dev/null "https://registry.npmjs.org/%40loomup%2Fclient/${VERSION}" \
+              && curl --fail --silent --output /dev/null "https://registry.npmjs.org/%40loomup%2Fastro/${VERSION}" \
+              && curl --fail --silent --output /dev/null "https://registry.npmjs.org/%40loomup%2Fcli/${VERSION}"; then
               break
             fi
             if [ "$attempt" -eq 12 ]; then
@@ -173,9 +175,9 @@ jobs:
           cd registry-smoke
           npm init --yes
           npm install \
-            "@loomup/client@${VERSION}" \
-            "@loomup/astro@${VERSION}" \
-            "@loomup/cli@${VERSION}"
+            "https://registry.npmjs.org/@loomup/client/-/client-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/astro/-/astro-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/cli/-/cli-${VERSION}.tgz"
           node --input-type=module <<'NODE'
           await import("@loomup/client");
           await import("@loomup/astro/server");
