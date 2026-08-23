@@ -1,7 +1,7 @@
-# Loomup SDKs
+# Loomup JavaScript SDKs
 
-Public client SDKs, framework integrations, schema tooling, and
-cross-language conformance fixtures for [Loomup](https://tryloomup.com).
+Public JavaScript/TypeScript client packages, framework integrations, and
+schema tooling for [Loomup](https://tryloomup.com).
 
 | Package | Purpose |
 | --- | --- |
@@ -15,11 +15,6 @@ cross-language conformance fixtures for [Loomup](https://tryloomup.com).
 | [`@loomup/nuxt`](packages/nuxt) | Nuxt module, server client, and composables |
 | [`@loomup/react-native`](packages/react-native) | React Native client, storage adapters, and hooks |
 | [`@loomup/tanstack-query`](packages/tanstack-query) | TanStack Query keys, options, and realtime cache helpers |
-| [Swift](native/swift) | Native Swift client and offline store; the repository root is an SPM package |
-| [Kotlin](native/kotlin) | JVM and Android client and offline store |
-| [Flutter/Dart](native/flutter) | Dart client and offline store |
-
-The shared native offline contract lives in [`conformance/`](conformance).
 Package-specific guides live beside each package; backend and protocol
 documentation remains in [`bluppco/loomup`](https://github.com/bluppco/loomup/tree/main/docs).
 
@@ -34,14 +29,6 @@ npm test
 
 The packages are tested serially because the integrations consume local
 `@loomup/client` and `@loomup/react` workspaces.
-
-Native SDKs are tested from their own package roots:
-
-```bash
-cd native/swift && swift test
-cd native/kotlin && ./gradlew test --no-daemon
-cd native/flutter && dart pub get && dart analyze --fatal-infos && dart test
-```
 
 ## Releases
 

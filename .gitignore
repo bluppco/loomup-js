@@ -2,11 +2,3 @@ node_modules/
 dist/
 *.tgz
 .DS_Store
-.build/
-native/swift/.build/
-native/kotlin/.gradle/
-native/kotlin/.kotlin/
-native/kotlin/build/
-native/flutter/.dart_tool/
-native/flutter/build/
-native/flutter/pubspec.lock
