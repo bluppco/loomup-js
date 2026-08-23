@@ -223,7 +223,7 @@ class LoomupClient {
         path != '/auth/register') {
       try {
         await refresh();
-        return request(
+        return await request(
           method,
           path,
           body: body,
@@ -274,7 +274,7 @@ class LoomupClient {
         !path.startsWith('/auth/')) {
       try {
         await refresh();
-        return requestStorageBytes(
+        return await requestStorageBytes(
           method,
           path,
           body: body,
