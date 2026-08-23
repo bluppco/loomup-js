@@ -41,6 +41,13 @@ jobs:
           const version = tag.slice(1);
           for (const manifest of [
             "packages/client/package.json",
+            "packages/offline/package.json",
+            "packages/react/package.json",
+            "packages/vue/package.json",
+            "packages/next/package.json",
+            "packages/nuxt/package.json",
+            "packages/tanstack-query/package.json",
+            "packages/react-native/package.json",
             "packages/astro/package.json",
             "packages/cli/package.json",
           ]) {
@@ -56,9 +63,30 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Keep package tests serial: Astro consumes the local client workspace.
+      # Keep package tests serial: integrations consume local SDK workspaces.
       - name: Test @loomup/client
         run: npm test --workspace @loomup/client
+
+      - name: Test @loomup/offline
+        run: npm test --workspace @loomup/offline
+
+      - name: Test @loomup/react
+        run: npm test --workspace @loomup/react
+
+      - name: Test @loomup/vue
+        run: npm test --workspace @loomup/vue
+
+      - name: Test @loomup/next
+        run: npm test --workspace @loomup/next
+
+      - name: Test @loomup/nuxt
+        run: npm test --workspace @loomup/nuxt
+
+      - name: Test @loomup/tanstack-query
+        run: npm test --workspace @loomup/tanstack-query
+
+      - name: Test @loomup/react-native
+        run: npm test --workspace @loomup/react-native
 
       - name: Test @loomup/astro
         run: npm test --workspace @loomup/astro
@@ -70,6 +98,13 @@ jobs:
         run: |
           mkdir npm-tarballs
           npm pack --workspace @loomup/client --pack-destination npm-tarballs
+          npm pack --workspace @loomup/offline --pack-destination npm-tarballs
+          npm pack --workspace @loomup/react --pack-destination npm-tarballs
+          npm pack --workspace @loomup/vue --pack-destination npm-tarballs
+          npm pack --workspace @loomup/next --pack-destination npm-tarballs
+          npm pack --workspace @loomup/nuxt --pack-destination npm-tarballs
+          npm pack --workspace @loomup/tanstack-query --pack-destination npm-tarballs
+          npm pack --workspace @loomup/react-native --pack-destination npm-tarballs
           npm pack --workspace @loomup/astro --pack-destination npm-tarballs
           npm pack --workspace @loomup/cli --pack-destination npm-tarballs
 
@@ -82,18 +117,34 @@ jobs:
           npm init --yes
           npm install \
             "../npm-tarballs/loomup-client-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-offline-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-react-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-vue-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-next-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-nuxt-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-tanstack-query-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-react-native-${VERSION}.tgz" \
             "../npm-tarballs/loomup-astro-${VERSION}.tgz" \
             "../npm-tarballs/loomup-cli-${VERSION}.tgz"
           node --input-type=module <<'NODE'
           await import("@loomup/client");
           await import("@loomup/client/access");
           await import("@loomup/client/studio");
+          await import("@loomup/offline");
+          await import("@loomup/react");
+          await import("@loomup/vue");
+          await import("@loomup/next");
+          await import("@loomup/nuxt");
+          await import("@loomup/nuxt/server");
+          await import("@loomup/tanstack-query");
+          await import("@loomup/react-native");
           await import("@loomup/astro");
           await import("@loomup/astro/server");
           await import("@loomup/astro/client");
           await import("@loomup/astro/middleware");
           await import("@loomup/astro/auth");
           NODE
+          test -f node_modules/@loomup/offline/dist/sql-wasm.wasm
           ./node_modules/.bin/loomup --help
 
       - uses: actions/upload-artifact@v4
@@ -123,18 +174,33 @@ jobs:
           name: npm-tarballs-${{ needs.prepare.outputs.version }}
           path: npm-tarballs
 
+      - name: Select publication channel
+        id: release
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "publish_tag=next" >> "$GITHUB_OUTPUT"
+            echo "promote=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish_tag=latest" >> "$GITHUB_OUTPUT"
+            echo "promote=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish in dependency order
         env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          PUBLISH_TAG: ${{ steps.release.outputs.publish_tag }}
         run: |
-          for package in client astro cli; do
+          for package in client offline react vue next nuxt tanstack-query react-native astro cli; do
             name="@loomup/${package}"
             tarball="./npm-tarballs/loomup-${package}-${VERSION}.tgz"
             version_url="https://registry.npmjs.org/%40loomup%2F${package}/${VERSION}"
             if curl --fail --silent --output /dev/null "$version_url"; then
               echo "${name}@${VERSION} already exists; skipping publication."
             else
-              npm publish "$tarball" --access public --tag latest --provenance
+              npm publish "$tarball" --access public --tag "$PUBLISH_TAG" --provenance
             fi
           done
 
@@ -144,9 +210,14 @@ jobs:
           NPM_CONFIG_USERCONFIG: /dev/null
         run: |
           for attempt in $(seq 1 12); do
-            if curl --fail --silent --output /dev/null "https://registry.npmjs.org/%40loomup%2Fclient/${VERSION}" \
-              && curl --fail --silent --output /dev/null "https://registry.npmjs.org/%40loomup%2Fastro/${VERSION}" \
-              && curl --fail --silent --output /dev/null "https://registry.npmjs.org/%40loomup%2Fcli/${VERSION}"; then
+            visible=true
+            for package in client offline react vue next nuxt tanstack-query react-native astro cli; do
+              if ! curl --fail --silent --output /dev/null \
+                "https://registry.npmjs.org/%40loomup%2F${package}/${VERSION}"; then
+                visible=false
+              fi
+            done
+            if [ "$visible" = true ]; then
               break
             fi
             if [ "$attempt" -eq 12 ]; then
@@ -161,10 +232,35 @@ jobs:
           npm init --yes
           npm install --allow-remote=all \
             "https://registry.npmjs.org/@loomup/client/-/client-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/offline/-/offline-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/react/-/react-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/vue/-/vue-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/next/-/next-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/nuxt/-/nuxt-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/tanstack-query/-/tanstack-query-${VERSION}.tgz" \
+            "https://registry.npmjs.org/@loomup/react-native/-/react-native-${VERSION}.tgz" \
             "https://registry.npmjs.org/@loomup/astro/-/astro-${VERSION}.tgz" \
             "https://registry.npmjs.org/@loomup/cli/-/cli-${VERSION}.tgz"
           node --input-type=module <<'NODE'
           await import("@loomup/client");
+          await import("@loomup/offline");
+          await import("@loomup/react");
+          await import("@loomup/vue");
+          await import("@loomup/next");
+          await import("@loomup/nuxt/server");
+          await import("@loomup/tanstack-query");
+          await import("@loomup/react-native");
           await import("@loomup/astro/server");
           NODE
+          test -f node_modules/@loomup/offline/dist/sql-wasm.wasm
           ./node_modules/.bin/loomup --help
+
+      - name: Promote bootstrap release to latest
+        if: steps.release.outputs.promote == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          for package in client offline react vue next nuxt tanstack-query react-native astro cli; do
+            npm dist-tag add "@loomup/${package}@${VERSION}" latest
+          done

@@ -1,0 +1,57 @@
+{
+  "name": "@loomup/next",
+  "version": "0.1.1",
+  "description": "Next.js helpers for Loomup (cookie sessions, App Router, Pages Router, middleware)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/*.js",
+    "dist/*.d.ts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test/*.js",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@loomup/client": ">=0.1.0",
+    "next": ">=14.0.0",
+    "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@loomup/client": "0.1.1",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://tryloomup.com/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bluppco/loomup-js.git",
+    "directory": "packages/next"
+  },
+  "bugs": { "url": "https://github.com/bluppco/loomup-js/issues" },
+  "license": "MIT",
+  "publishConfig": { "access": "public" }
+}

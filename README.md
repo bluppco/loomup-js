@@ -9,6 +9,13 @@ rewrites.
 | [`@loomup/client`](packages/client) | TypeScript client for auth, resources, realtime, storage, and sync |
 | [`@loomup/astro`](packages/astro) | Astro integration, cookie-backed SSR client, islands client, and middleware |
 | [`@loomup/cli`](packages/cli) | Declarative schema and generated-client CLI |
+| [`@loomup/offline`](packages/offline) | Browser SQLite and offline resource client |
+| [`@loomup/react`](packages/react) | React provider, hooks, and sync helpers |
+| [`@loomup/vue`](packages/vue) | Vue plugin and composables |
+| [`@loomup/next`](packages/next) | Next.js sessions, router, and middleware helpers |
+| [`@loomup/nuxt`](packages/nuxt) | Nuxt module, server client, and composables |
+| [`@loomup/react-native`](packages/react-native) | React Native client, storage adapters, and hooks |
+| [`@loomup/tanstack-query`](packages/tanstack-query) | TanStack Query keys, options, and realtime cache helpers |
 
 ## Development
 
@@ -19,22 +26,25 @@ npm ci
 npm test
 ```
 
-The packages are tested serially because `@loomup/astro` consumes the local
-`@loomup/client` workspace.
+The packages are tested serially because the integrations consume local
+`@loomup/client` and `@loomup/react` workspaces.
 
 ## Releases
 
-All three packages currently share one version. A `vX.Y.Z` tag must match every
+All packages share one version. A `vX.Y.Z` tag must match every
 package manifest. The release workflow tests and packs the packages, installs
 the tarballs in a clean project, and then publishes in dependency order:
 
 ```text
-@loomup/client -> @loomup/astro -> @loomup/cli
+@loomup/client -> offline, react, vue, next, nuxt, tanstack-query, astro
+@loomup/react  -> react-native
+@loomup/cli    -> standalone
 ```
 
 Releases use npm trusted publishing through GitHub Actions OIDC. The trusted
 publisher is restricted to `bluppco/loomup-js`, `release.yml`, and the
-`npm-production` environment; no npm publish token is stored in GitHub.
+`npm-production` environment. GitHub does not retain an npm publish token
+after a package's initial bootstrap release.
 
 ## License
 

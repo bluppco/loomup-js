@@ -1,0 +1,60 @@
+{
+  "name": "@loomup/react-native",
+  "version": "0.1.1",
+  "description": "React Native helpers for Loomup Realtime (AsyncStorage session + hooks)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/*.js",
+    "dist/*.d.ts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --experimental-vm-modules --test dist/test/*.js",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@loomup/client": ">=0.1.0",
+    "@loomup/react": ">=0.1.0",
+    "@react-native-async-storage/async-storage": ">=1.0.0",
+    "react": ">=18",
+    "react-native": ">=0.72.0"
+  },
+  "peerDependenciesMeta": {
+    "react-native": {
+      "optional": true
+    },
+    "@react-native-async-storage/async-storage": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@loomup/client": "0.1.1",
+    "@loomup/react": "0.1.1",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
+    "react": "^18.3.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://tryloomup.com/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bluppco/loomup-js.git",
+    "directory": "packages/react-native"
+  },
+  "bugs": { "url": "https://github.com/bluppco/loomup-js/issues" },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

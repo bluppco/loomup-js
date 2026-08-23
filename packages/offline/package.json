@@ -1,0 +1,42 @@
+{
+  "name": "@loomup/offline",
+  "version": "0.1.1",
+  "description": "First-party browser SQLite and offline resource client for Loomup",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist/*.js", "dist/*.d.ts", "dist/sql-wasm.wasm"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-wasm.mjs",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "sql.js": "^1.14.1"
+  },
+  "peerDependencies": {
+    "@loomup/client": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@loomup/client": "0.1.1",
+    "@types/node": "^22.0.0",
+    "@types/sql.js": "^1.4.11",
+    "typescript": "^5.7.0"
+  },
+  "engines": { "node": ">=18" },
+  "homepage": "https://tryloomup.com/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bluppco/loomup-js.git",
+    "directory": "packages/offline"
+  },
+  "bugs": { "url": "https://github.com/bluppco/loomup-js/issues" },
+  "license": "MIT",
+  "publishConfig": { "access": "public" }
+}

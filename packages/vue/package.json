@@ -1,7 +1,7 @@
 {
-  "name": "@loomup/client",
+  "name": "@loomup/vue",
   "version": "0.1.1",
-  "description": "TypeScript client for Loomup Realtime",
+  "description": "Vue 3 composables and plugin for Loomup Realtime",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -9,29 +9,28 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
-    },
-    "./access": {
-      "import": "./dist/access.js",
-      "types": "./dist/access.d.ts"
-    },
-    "./studio": {
-      "import": "./browser/studio-runtime.js",
-      "types": "./browser/studio-runtime.d.ts"
     }
   },
   "files": [
     "dist/*.js",
-    "dist/*.d.ts",
-    "browser"
+    "dist/*.d.ts"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js test/*.test.mjs",
+    "test": "tsc -p tsconfig.json && node --experimental-vm-modules --import ./dist/test/setup.js --test dist/test/composables.test.js",
     "prepack": "npm run build"
   },
+  "peerDependencies": {
+    "@loomup/client": ">=0.1.0",
+    "vue": ">=3.3"
+  },
   "devDependencies": {
+    "@loomup/client": "0.1.1",
+    "@types/jsdom": "^28.0.3",
+    "@types/node": "^22.0.0",
+    "jsdom": "^26.0.0",
     "typescript": "^5.7.0",
-    "@types/node": "^22.0.0"
+    "vue": "^3.5.0"
   },
   "engines": {
     "node": ">=18"
@@ -40,11 +39,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bluppco/loomup-js.git",
-    "directory": "packages/client"
+    "directory": "packages/vue"
   },
-  "bugs": {
-    "url": "https://github.com/bluppco/loomup-js/issues"
-  },
+  "bugs": { "url": "https://github.com/bluppco/loomup-js/issues" },
   "license": "MIT",
   "publishConfig": {
     "access": "public"
