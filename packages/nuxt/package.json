@@ -44,6 +44,7 @@
   "devDependencies": {
     "@loomup/client": "0.1.1",
     "@types/node": "^22.0.0",
+    "@nuxt/schema": "^3.15.0",
     "h3": "^1.13.0",
     "nuxt": "^3.15.0",
     "typescript": "^5.7.0",
