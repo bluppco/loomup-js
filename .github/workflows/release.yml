@@ -19,8 +19,8 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: npm
@@ -112,10 +112,10 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
       - name: Install npm with trusted-publishing support
         run: npm install --global npm@12.0.2
       - uses: actions/download-artifact@v4
@@ -123,24 +123,9 @@ jobs:
           name: npm-tarballs-${{ needs.prepare.outputs.version }}
           path: npm-tarballs
 
-      - name: Select publication channel
-        id: release
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "publish_tag=next" >> "$GITHUB_OUTPUT"
-            echo "promote=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish_tag=latest" >> "$GITHUB_OUTPUT"
-            echo "promote=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish in dependency order
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
-          PUBLISH_TAG: ${{ steps.release.outputs.publish_tag }}
         run: |
           for package in client astro cli; do
             name="@loomup/${package}"
@@ -149,7 +134,7 @@ jobs:
             if curl --fail --silent --output /dev/null "$version_url"; then
               echo "${name}@${VERSION} already exists; skipping publication."
             else
-              npm publish "$tarball" --access public --tag "$PUBLISH_TAG" --provenance
+              npm publish "$tarball" --access public --tag latest --provenance
             fi
           done
 
@@ -183,13 +168,3 @@ jobs:
           await import("@loomup/astro/server");
           NODE
           ./node_modules/.bin/loomup --help
-
-      - name: Promote first release to latest
-        if: steps.release.outputs.promote == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          npm dist-tag add "@loomup/client@${VERSION}" latest
-          npm dist-tag add "@loomup/astro@${VERSION}" latest
-          npm dist-tag add "@loomup/cli@${VERSION}" latest
