@@ -13,8 +13,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  native:
+    name: ${{ matrix.name }} compatibility
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Swift
+            os: macos-latest
+            directory: native/swift
+            tool: swift
+          - name: Kotlin
+            os: ubuntu-latest
+            directory: native/kotlin
+            tool: kotlin
+          - name: Flutter
+            os: ubuntu-latest
+            directory: native/flutter
+            tool: flutter
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up JDK 17
+        if: matrix.tool == 'kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up Dart
+        if: matrix.tool == 'flutter'
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: Test Swift
+        if: matrix.tool == 'swift'
+        run: swift test
+      - name: Test Kotlin
+        if: matrix.tool == 'kotlin'
+        run: ./gradlew test --no-daemon
+      - name: Analyze and test Flutter
+        if: matrix.tool == 'flutter'
+        run: |
+          dart pub get
+          dart analyze --fatal-infos
+          dart test
+
   prepare:
     name: Test and package
+    needs: native
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

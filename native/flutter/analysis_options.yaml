@@ -1,0 +1,13 @@
+include: package:lints/recommended.yaml
+
+linter:
+  rules:
+    public_member_api_docs: false
+    prefer_const_constructors: true
+    prefer_final_locals: true
+    avoid_print: true
+
+analyzer:
+  errors:
+    missing_return: error
+    dead_code: warning

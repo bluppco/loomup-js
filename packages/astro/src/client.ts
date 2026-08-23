@@ -99,9 +99,11 @@ export function createBrowserClient<
   });
 }
 
-export type CreateAuthenticatedProjectOptions = CreateBrowserClientOptions & {
+export type CreateAuthenticatedProjectOptions = {
   /** Same-origin catch-all endpoint. Default: `/api/loomup`. */
   authEndpoint?: string;
+  /** Same-origin data gateway. Default: `<authEndpoint>/data`. */
+  dataEndpoint?: string;
   fetch?: typeof fetch;
 };
 
@@ -120,7 +122,7 @@ async function authRequest(
   endpoint: string,
   action: string,
   init?: RequestInit,
-): Promise<{ user?: User; access_token?: string; ok?: boolean }> {
+): Promise<{ user?: User; ok?: boolean }> {
   const response = await fetchImpl(`${endpoint.replace(/\/$/, "")}/${action}`, {
     credentials: "same-origin",
     ...init,
@@ -131,7 +133,7 @@ async function authRequest(
     },
   });
   const payload = (await response.json().catch(() => ({}))) as {
-    data?: { user?: User; access_token?: string; ok?: boolean };
+    data?: { user?: User; ok?: boolean };
     error?: { code?: string; message?: string };
   };
   if (!response.ok) {
@@ -145,8 +147,8 @@ async function authRequest(
 }
 
 /**
- * Hydrate the typed `db.issues` project client without exposing the refresh
- * token to JavaScript. Access-token renewal goes through the Astro endpoint.
+ * Hydrate the typed `db.issues` project client through Astro's same-origin
+ * data gateway. Loomup's URL and both session tokens remain server-only.
  */
 export async function createAuthenticatedProject<
   TMap = DefaultTableMap,
@@ -162,16 +164,17 @@ export async function createAuthenticatedProject<
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const endpoint = options.authEndpoint ?? "/api/loomup";
   const session = await authRequest(fetchImpl, endpoint, "session", { method: "GET" });
-  if (!session.user || !session.access_token) {
+  if (!session.user) {
     throw new LoomupError("authenticated session required", "unauthorized", 401);
   }
   const db = createProject<TMap, TInsertMap, TUpdateMap>({
-    url: resolveBrowserUrl(options.url),
-    token: session.access_token,
-    WebSocketImpl: options.WebSocketImpl,
+    url: options.dataEndpoint ?? `${endpoint.replace(/\/$/, "")}/data`,
     accessTokenProvider: async () => {
-      const refreshed = await authRequest(fetchImpl, endpoint, "refresh", { method: "POST" });
-      return refreshed.access_token;
+      await authRequest(fetchImpl, endpoint, "refresh", { method: "POST" });
+      // The core client requires a truthy retry signal. This marker is sent
+      // only to the same-origin gateway, which replaces Authorization with
+      // the server-held access token.
+      return "server-session";
     },
   });
   return {

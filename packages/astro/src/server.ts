@@ -82,7 +82,7 @@ export type CreateServerClientOptions = {
   client?: Omit<CreateClientOptions, "url" | "token" | "refreshToken">;
 };
 
-function resolveServerUrl(explicit?: string): string {
+export function resolveServerUrl(explicit?: string): string {
   if (explicit) return explicit;
   if (typeof process !== "undefined") {
     const fromEnv =

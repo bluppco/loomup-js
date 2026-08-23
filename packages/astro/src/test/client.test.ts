@@ -40,7 +40,6 @@ describe("createAuthenticatedProject", () => {
       return new Response(
         JSON.stringify({
           data: {
-            access_token: "access",
             user: {
               id: "u1",
               email: "user@example.com",
@@ -56,12 +55,12 @@ describe("createAuthenticatedProject", () => {
     const session = await createAuthenticatedProject<{
       issues: { id: string; title: string };
     }>({
-      url: "https://project.example",
       authEndpoint: "/api/loomup",
       fetch: fetchImpl,
     });
     assert.equal(session.user.id, "u1");
     assert.equal(session.db.issues.name, "issues");
+    assert.equal(session.db.url, "/api/loomup/data");
     assert.deepEqual(requests, ["/api/loomup/session"]);
   });
 });
