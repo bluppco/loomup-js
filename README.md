@@ -32,8 +32,9 @@ the tarballs in a clean project, and then publishes in dependency order:
 @loomup/client -> @loomup/astro -> @loomup/cli
 ```
 
-The first release can use a short-lived granular `NPM_TOKEN`. Later releases
-use npm trusted publishing through GitHub Actions OIDC.
+Releases use npm trusted publishing through GitHub Actions OIDC. The trusted
+publisher is restricted to `bluppco/loomup-js`, `release.yml`, and the
+`npm-production` environment; no npm publish token is stored in GitHub.
 
 ## License
 
