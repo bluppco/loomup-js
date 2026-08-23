@@ -1,0 +1,17 @@
+{
+  "name": "loomup-js",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JavaScript and TypeScript packages for Loomup",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @loomup/client && npm run build --workspace @loomup/astro && npm run build --workspace @loomup/cli",
+    "test": "npm test --workspace @loomup/client && npm test --workspace @loomup/astro && npm test --workspace @loomup/cli"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

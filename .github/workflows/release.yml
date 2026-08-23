@@ -1,0 +1,193 @@
+name: Publish npm packages
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Test and package
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Validate release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const tag = process.env.RELEASE_TAG;
+          if (!tag?.startsWith("v")) {
+            throw new Error(`expected v* tag, received ${tag ?? "<missing>"}`);
+          }
+
+          const version = tag.slice(1);
+          for (const manifest of [
+            "packages/client/package.json",
+            "packages/astro/package.json",
+            "packages/cli/package.json",
+          ]) {
+            const pkg = JSON.parse(fs.readFileSync(manifest, "utf8"));
+            if (pkg.version !== version) {
+              throw new Error(`${manifest} is ${pkg.version}, but the tag is ${tag}`);
+            }
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          NODE
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Keep package tests serial: Astro consumes the local client workspace.
+      - name: Test @loomup/client
+        run: npm test --workspace @loomup/client
+
+      - name: Test @loomup/astro
+        run: npm test --workspace @loomup/astro
+
+      - name: Test @loomup/cli
+        run: npm test --workspace @loomup/cli
+
+      - name: Build release tarballs
+        run: |
+          mkdir npm-tarballs
+          npm pack --workspace @loomup/client --pack-destination npm-tarballs
+          npm pack --workspace @loomup/astro --pack-destination npm-tarballs
+          npm pack --workspace @loomup/cli --pack-destination npm-tarballs
+
+      - name: Smoke-test packed artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir package-smoke
+          cd package-smoke
+          npm init --yes
+          npm install \
+            "../npm-tarballs/loomup-client-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-astro-${VERSION}.tgz" \
+            "../npm-tarballs/loomup-cli-${VERSION}.tgz"
+          node --input-type=module <<'NODE'
+          await import("@loomup/client");
+          await import("@loomup/client/access");
+          await import("@loomup/client/studio");
+          await import("@loomup/astro");
+          await import("@loomup/astro/server");
+          await import("@loomup/astro/client");
+          await import("@loomup/astro/middleware");
+          await import("@loomup/astro/auth");
+          NODE
+          ./node_modules/.bin/loomup --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs-${{ steps.version.outputs.version }}
+          path: npm-tarballs/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to npm
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: npm-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Install npm with trusted-publishing support
+        run: npm install --global npm@12.0.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-tarballs-${{ needs.prepare.outputs.version }}
+          path: npm-tarballs
+
+      - name: Select publication channel
+        id: release
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "publish_tag=next" >> "$GITHUB_OUTPUT"
+            echo "promote=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish_tag=latest" >> "$GITHUB_OUTPUT"
+            echo "promote=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish in dependency order
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PUBLISH_TAG: ${{ steps.release.outputs.publish_tag }}
+        run: |
+          for package in client astro cli; do
+            name="@loomup/${package}"
+            tarball="npm-tarballs/loomup-${package}-${VERSION}.tgz"
+            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${name}@${VERSION} already exists; skipping publication."
+            else
+              npm publish "$tarball" --access public --tag "$PUBLISH_TAG" --provenance
+            fi
+          done
+
+      - name: Verify registry artifacts
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          for attempt in $(seq 1 12); do
+            if npm view "@loomup/client@${VERSION}" version >/dev/null 2>&1 \
+              && npm view "@loomup/astro@${VERSION}" version >/dev/null 2>&1 \
+              && npm view "@loomup/cli@${VERSION}" version >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 12 ]; then
+              echo "Published versions did not become visible in time." >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+          mkdir registry-smoke
+          cd registry-smoke
+          npm init --yes
+          npm install \
+            "@loomup/client@${VERSION}" \
+            "@loomup/astro@${VERSION}" \
+            "@loomup/cli@${VERSION}"
+          node --input-type=module <<'NODE'
+          await import("@loomup/client");
+          await import("@loomup/astro/server");
+          NODE
+          ./node_modules/.bin/loomup --help
+
+      - name: Promote first release to latest
+        if: steps.release.outputs.promote == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          npm dist-tag add "@loomup/client@${VERSION}" latest
+          npm dist-tag add "@loomup/astro@${VERSION}" latest
+          npm dist-tag add "@loomup/cli@${VERSION}" latest

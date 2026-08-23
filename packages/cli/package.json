@@ -1,0 +1,49 @@
+{
+  "name": "@loomup/cli",
+  "version": "0.1.0",
+  "description": "Declarative schema migration CLI for Loomup projects",
+  "type": "module",
+  "bin": {
+    "loomup": "dist/cli.js"
+  },
+  "main": "dist/cli.js",
+  "types": "dist/cli.d.ts",
+  "files": [
+    "dist/cli.js",
+    "dist/cli.d.ts",
+    "dist/generate.js",
+    "dist/generate.d.ts",
+    "dist/access.js",
+    "dist/access.d.ts",
+    "templates/loomup.schema.yaml",
+    "templates/loomup.access.ts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "typescript": "^5.7.0",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://tryloomup.com/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bluppco/loomup-js.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/bluppco/loomup-js/issues"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

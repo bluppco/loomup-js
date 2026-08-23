@@ -1,0 +1,96 @@
+# Loomup project schema
+#
+# Tables are top-level keys. Fields are required unless their type ends in `?`.
+# This starter table is valid as-is; rename or replace it for your application.
+
+# Optional project storage buckets. Uncomment and rename as needed:
+# $buckets:
+#   attachments:
+#     public: false
+#
+# Authorization belongs in loomup.access.ts. Loomup compiles its app-level
+# profile and automatically follows the references declared below.
+#
+# Hosted auth and Cloudflare transactional email are also schema-owned. Secrets
+# stay in Loomup's environment and never appear in this file:
+#
+# $auth:
+#   registration: disabled # or public
+#   password_reset_url: https://app.example.com/reset-password
+# $email:
+#   from: hello@app.example.com
+#   name: Example App
+# $origins:
+#   - https://app.example.com
+
+todos:
+  title: text
+  completed: boolean
+  created_at: datetime
+  updated_at: datetime
+  $indexes:
+    - completed
+
+# Available field types
+#
+#   text       UTF-8 text.
+#   integer    Whole number.
+#   real       Floating-point number.
+#   boolean    Stored as 0/1; defaults to false.
+#   datetime   Unix time in milliseconds.
+#   json       JSON value with database validation.
+#   <table>    Reference to the single-column primary key of another table.
+#
+# Every table receives a Loomup-managed UUID `id` primary key. Do not declare
+# `id` yourself. Add `?` to make a field nullable:
+#
+#   description: text?
+#   published_at: datetime?
+#   owner_id: users?
+#
+# `created_at` and `updated_at` datetime fields default to the current time.
+# Use an expanded field when you need a literal default or `now`:
+#
+#   priority:
+#     type: integer
+#     default: 0
+#   published_at:
+#     type: datetime?
+#     default: now
+#   status:
+#     enum: [draft, published, archived]
+#     default: draft
+#
+# References are declared by using a table name as the type:
+#
+# users:
+#   email: text
+#   $indexes:
+#     - unique: email
+#
+# posts:
+#   author_id: users
+#   title: text
+#   metadata: json?
+#   $indexes:
+#     - author_id
+#     - [author_id, title]
+#
+# Table metadata supports `$indexes`. Index forms:
+#
+#   $indexes:
+#     - email                          # ordinary single-field index
+#     - [workspace_id, created_at]     # ordinary compound index
+#     - unique: [workspace_id, slug]   # unique index
+#
+# Preserve natural/composite keys with a unique index; `id` remains the primary key:
+#
+# project_members:
+#   project_id: projects
+#   user_id: users
+#   role:
+#     enum: [owner, editor, viewer]
+#     default: viewer
+#   $indexes:
+#     - unique: [project_id, user_id]
+#     - user_id

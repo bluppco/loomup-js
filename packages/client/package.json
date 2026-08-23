@@ -1,0 +1,52 @@
+{
+  "name": "@loomup/client",
+  "version": "0.1.0",
+  "description": "TypeScript client for Loomup Realtime",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./access": {
+      "import": "./dist/access.js",
+      "types": "./dist/access.d.ts"
+    },
+    "./studio": {
+      "import": "./browser/studio-runtime.js",
+      "types": "./browser/studio-runtime.d.ts"
+    }
+  },
+  "files": [
+    "dist/*.js",
+    "dist/*.d.ts",
+    "browser"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js test/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://tryloomup.com/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bluppco/loomup-js.git",
+    "directory": "packages/client"
+  },
+  "bugs": {
+    "url": "https://github.com/bluppco/loomup-js/issues"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}
