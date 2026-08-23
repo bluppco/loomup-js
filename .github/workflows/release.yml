@@ -174,7 +174,7 @@ jobs:
           mkdir registry-smoke
           cd registry-smoke
           npm init --yes
-          npm install \
+          npm install --allow-remote=all \
             "https://registry.npmjs.org/@loomup/client/-/client-${VERSION}.tgz" \
             "https://registry.npmjs.org/@loomup/astro/-/astro-${VERSION}.tgz" \
             "https://registry.npmjs.org/@loomup/cli/-/cli-${VERSION}.tgz"
