@@ -1148,6 +1148,11 @@ describe("subscribeReady awaits server subscribed ack", () => {
     // Wait until OPEN + subscribe frame sent, but before server ack.
     await new Promise((r) => setTimeout(r, 40));
     assert.equal(resolved, false, "must not resolve before subscribed frame");
+    assert.equal(
+      sent.filter((frame) => frame.includes('"type":"subscribe"')).length,
+      1,
+      "subscribeReady must emit exactly one subscribe frame",
+    );
     const lastSub = [...sent]
       .reverse()
       .find((s) => s.includes('"type":"subscribe"'));
@@ -1172,6 +1177,7 @@ describe("subscribeReady awaits server subscribed ack", () => {
 
     const unsub = await ready;
     assert.equal(resolved, true);
+    assert.equal(sent.filter((frame) => frame.includes('"type":"subscribe"')).length, 1);
     unsub();
     c.closeRealtime();
   });

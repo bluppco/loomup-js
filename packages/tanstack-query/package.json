@@ -1,6 +1,6 @@
 {
   "name": "@loomup/tanstack-query",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "TanStack Query helpers for the Loomup TypeScript client",
   "type": "module",
   "main": "dist/index.js",
@@ -25,7 +25,7 @@
     "@tanstack/query-core": "^5.0.0"
   },
   "devDependencies": {
-    "@loomup/client": "0.1.1",
+    "@loomup/client": "0.1.2",
     "@tanstack/query-core": "^5.66.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
@@ -39,7 +39,11 @@
     "url": "git+https://github.com/bluppco/loomup-js.git",
     "directory": "packages/tanstack-query"
   },
-  "bugs": { "url": "https://github.com/bluppco/loomup-js/issues" },
+  "bugs": {
+    "url": "https://github.com/bluppco/loomup-js/issues"
+  },
   "license": "MIT",
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }

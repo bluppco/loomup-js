@@ -1,6 +1,6 @@
 {
   "name": "@loomup/nuxt",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Nuxt module for Loomup (cookie sessions, server client, Vue composables)",
   "type": "module",
   "main": "dist/module.js",
@@ -42,7 +42,7 @@
     "@nuxt/kit": "^3.15.0"
   },
   "devDependencies": {
-    "@loomup/client": "0.1.1",
+    "@loomup/client": "0.1.2",
     "@types/node": "^22.0.0",
     "@nuxt/schema": "^3.15.0",
     "h3": "^1.13.0",
@@ -59,7 +59,9 @@
     "url": "git+https://github.com/bluppco/loomup-js.git",
     "directory": "packages/nuxt"
   },
-  "bugs": { "url": "https://github.com/bluppco/loomup-js/issues" },
+  "bugs": {
+    "url": "https://github.com/bluppco/loomup-js/issues"
+  },
   "license": "MIT",
   "publishConfig": {
     "access": "public"

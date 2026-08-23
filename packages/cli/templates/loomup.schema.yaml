@@ -23,6 +23,10 @@
 # $origins:
 #   - https://app.example.com
 
+# Realtime is disabled by default. List only tables that clients may subscribe to.
+$realtime:
+  tables: []
+
 todos:
   title: text
   completed: boolean

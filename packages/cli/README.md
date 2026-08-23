@@ -59,7 +59,20 @@ npx loomup migrate
 
 `init`, `link`, and every successful `migrate` also generate a project-specific
 TypeScript client at `.loomup/client.ts`. Regenerate it without touching the
-remote database with `npx loomup generate`.
+remote database with `npx loomup generate`; use `npx loomup generate --check`
+in CI to reject stale checked-in output. `package.json#loomup.output` changes
+the default output path.
+
+Realtime is disabled unless the schema declares a table explicitly:
+
+```yaml
+$realtime:
+  tables: [issues, issue_comments]
+```
+
+Migration plans show realtime enable/disable changes. Unknown table names fail
+before deployment, and the generated `RealtimeTable` type lets TypeScript
+subscription helpers prevent subscriptions to undeclared tables.
 
 ```ts
 import { createDb } from "./.loomup/client";

@@ -196,7 +196,7 @@ const and = (...parts: string[]) => `(${parts.join(") AND (")})`;
 const or = (...parts: string[]) => `(${parts.join(") OR (")})`;
 
 function access(read: string, create: string, update: string, remove: string): AccessOperations {
-  return { read, create, update, delete: remove, subscribe: "false", notify: "false" };
+  return { read, create, update, delete: remove, subscribe: read, notify: "false" };
 }
 
 function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectConfig): CompiledAccess {

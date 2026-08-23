@@ -477,6 +477,22 @@ test("generated client source never embeds a credential", () => {
   assert.ok(!source.includes("loomup_sk_"));
 });
 
+test("generated clients expose only declared realtime tables", () => {
+  const source = generateClientSource(`
+$realtime:
+  tables: [issues]
+issues:
+  title: text
+projects:
+  name: text
+`);
+  assert.ok(source.includes('export type RealtimeTable = "issues";'));
+  assert.throws(
+    () => generateClientSource("$realtime:\n  tables: [missing]\nissues:\n  title: text\n"),
+    /not declared as an exposed schema table/,
+  );
+});
+
 test("generated clients reserve managed ids and reject custom primary keys", () => {
   assert.throws(
     () => generateClientSource("projects:\n  id: id\n  name: text\n"),
@@ -547,6 +563,7 @@ issues:
     "issues", "memberships", "project_members", "projects", "users", "workspaces",
   ]);
   assert.match(compiled.tables.issues!.read, /exists\(memberships/);
+  assert.equal(compiled.tables.issues!.subscribe, compiled.tables.issues!.read);
   assert.match(compiled.tables.issues!.read, /exists\(project_members/);
   assert.ok(!schema.includes("exists("));
 });

@@ -1,6 +1,6 @@
 {
   "name": "@loomup/next",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Next.js helpers for Loomup (cookie sessions, App Router, Pages Router, middleware)",
   "type": "module",
   "main": "dist/index.js",
@@ -34,7 +34,7 @@
     }
   },
   "devDependencies": {
-    "@loomup/client": "0.1.1",
+    "@loomup/client": "0.1.2",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "next": "^15.0.0",
@@ -51,7 +51,11 @@
     "url": "git+https://github.com/bluppco/loomup-js.git",
     "directory": "packages/next"
   },
-  "bugs": { "url": "https://github.com/bluppco/loomup-js/issues" },
+  "bugs": {
+    "url": "https://github.com/bluppco/loomup-js/issues"
+  },
   "license": "MIT",
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }

@@ -32,6 +32,7 @@ export type GenerateClientOptions = {
   platformUrl?: string;
   projectId?: string;
   outputPath?: string;
+  check?: boolean;
 };
 
 export type GeneratedClient = {
@@ -145,7 +146,7 @@ function primaryKey(table: string, _fields: ParsedField[], indexes: unknown): Se
   return new Set(["id"]);
 }
 
-function parseSchema(source: string): ParsedTable[] {
+function parseSchema(source: string): { tables: ParsedTable[]; realtimeTables: Set<string> } {
   let value: unknown;
   try {
     value = parse(source);
@@ -155,7 +156,7 @@ function parseSchema(source: string): ParsedTable[] {
   const root = object(value, "schema root");
   if (!Object.keys(root).length) throw new Error("schema must declare at least one table");
 
-  const projectMetadata = new Set(["$buckets", "$policies", "$auth", "$email", "$origins"]);
+  const projectMetadata = new Set(["$buckets", "$policies", "$auth", "$email", "$origins", "$realtime"]);
   for (const key of Object.keys(root).filter((key) => key.startsWith("$"))) {
     if (!projectMetadata.has(key)) throw new Error(`unknown project metadata \`${key}\``);
   }
@@ -177,7 +178,7 @@ function parseSchema(source: string): ParsedTable[] {
   const usedNames = new Map<string, number>();
   const tableEntries = Object.entries(root).filter(([name]) => !name.startsWith("$"));
   if (!tableEntries.length) throw new Error("schema must declare at least one table");
-  return tableEntries.map(([tableName, tableValue]) => {
+  const tables = tableEntries.map(([tableName, tableValue]) => {
     const definition = object(tableValue, `table \`${tableName}\``);
     for (const key of Object.keys(definition).filter((key) => key.startsWith("$"))) {
       if (key !== "$indexes" && key !== "$access") {
@@ -213,6 +214,23 @@ function parseSchema(source: string): ParsedTable[] {
       primaryKey: keys,
     };
   });
+  const realtimeTables = new Set<string>();
+  if (root.$realtime !== undefined) {
+    const realtime = object(root.$realtime, "`$realtime`");
+    const unknown = Object.keys(realtime).filter((key) => key !== "tables");
+    if (unknown.length) throw new Error(`unknown \`$realtime\` setting \`${unknown[0]}\``);
+    if (!Array.isArray(realtime.tables)) throw new Error("`$realtime.tables` must be a list");
+    const known = new Set(tables.map((table) => table.name));
+    for (const value of realtime.tables) {
+      if (typeof value !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+        throw new Error("`$realtime.tables` entries must be valid table names");
+      }
+      if (realtimeTables.has(value)) throw new Error(`realtime table \`${value}\` is declared more than once`);
+      if (!known.has(value)) throw new Error(`realtime table \`${value}\` is not declared as an exposed schema table`);
+      realtimeTables.add(value);
+    }
+  }
+  return { tables, realtimeTables };
 }
 
 function fieldType(field: ParsedField, tables: Map<string, ParsedTable>, seen = new Set<string>()): string {
@@ -258,7 +276,7 @@ export function generateClientSource(
   schemaSource: string,
   options: Pick<GenerateClientOptions, "platformUrl" | "projectId"> = {},
 ): string {
-  const tables = parseSchema(schemaSource);
+  const { tables, realtimeTables } = parseSchema(schemaSource);
   const tableMap = new Map(tables.map((table) => [table.name, table]));
   const gateway = projectGateway(options.platformUrl, options.projectId);
   const lines: string[] = [
@@ -315,8 +333,11 @@ export function generateClientSource(
   for (const table of tables) {
     lines.push(`  ${JSON.stringify(table.name)}: ${table.interfaceName}Update;`);
   }
+  const realtimeUnion = [...realtimeTables].map((table) => JSON.stringify(table)).join(" | ") || "never";
   lines.push(
     "}",
+    "",
+    `export type RealtimeTable = ${realtimeUnion};`,
     "",
     "export type Db = LoomupProject<TableMap, TableInsertMap, TableUpdateMap>;",
     "",
@@ -343,6 +364,13 @@ export async function generateClient(options: GenerateClientOptions): Promise<Ge
   const schemaSource = await readFile(options.schemaPath, "utf8");
   const source = generateClientSource(schemaSource, options);
   const outputPath = resolve(options.projectRoot, options.outputPath ?? DEFAULT_CLIENT_PATH);
+  if (options.check) {
+    const existing = await readFile(outputPath, "utf8").catch(() => undefined);
+    if (existing !== source) {
+      throw new Error(`generated Loomup client is stale: ${outputPath}; run \`loomup generate\``);
+    }
+    return { outputPath, source };
+  }
   await mkdir(dirname(outputPath), { recursive: true });
   await writeFile(outputPath, source, "utf8");
   return { outputPath, source };

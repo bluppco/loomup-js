@@ -1,6 +1,6 @@
 {
   "name": "loomup-js",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "JavaScript and TypeScript packages for Loomup",
   "workspaces": [

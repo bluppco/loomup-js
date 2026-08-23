@@ -531,11 +531,16 @@ export class LoomupClient<
   private pendingSubscribeAcks = new Map<
     string,
     {
+      key: string;
       resolve: () => void;
       reject: (err: Error) => void;
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  private pendingSubscribeByKey = new Map<string, { requestId: string; promise: Promise<void> }>();
+  private queuedSubscribeRequestIds = new Map<string, string>();
+  private subscribeRequestKeys = new Map<string, string>();
+  private acknowledgedSubscriptions = new Set<string>();
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private intentionalClose = false;
   private refreshing: Promise<AuthTokens> | null = null;
@@ -1199,6 +1204,9 @@ export class LoomupClient<
       this.send({ type: "auth", token: this.token });
     }
     for (const key of this.subs.keys()) {
+      this.acknowledgedSubscriptions.delete(key);
+      const pending = this.pendingSubscribeByKey.get(key);
+      if (pending) this.queuedSubscribeRequestIds.set(key, pending.requestId);
       const { table, rowId } = parseSubKey(key);
       this.sendSubscribe(table, rowId);
     }
@@ -1256,6 +1264,8 @@ export class LoomupClient<
       this.subs.get(key)?.delete(handler);
       if (this.subs.get(key)?.size === 0) {
         this.subs.delete(key);
+        this.acknowledgedSubscriptions.delete(key);
+        this.queuedSubscribeRequestIds.delete(key);
         // Row-scoped unsub must include id so other row subs on the table remain.
         const msg: Record<string, unknown> = {
           type: "unsubscribe",
@@ -1277,7 +1287,7 @@ export class LoomupClient<
     const { isFirst } = this.registerSubscribeHandler(table, handler, rowId);
     this.ensureWs();
     // Only the first handler for a key sends a subscribe frame.
-    if (isFirst) {
+    if (isFirst && this.ws?.readyState === 1) {
       this.sendSubscribe(table, rowId);
     }
     return this.makeUnsub(table, handler, rowId);
@@ -1295,16 +1305,23 @@ export class LoomupClient<
     rowId?: string,
     timeoutMs = 5000,
   ): Promise<() => void> {
-    const { isFirst } = this.registerSubscribeHandler(table, handler, rowId);
+    const { key } = this.registerSubscribeHandler(table, handler, rowId);
     const unsub = this.makeUnsub(table, handler, rowId);
     try {
+      if (this.acknowledgedSubscriptions.has(key)) return unsub;
+      let pending = this.pendingSubscribeByKey.get(key);
+      if (!pending) {
+        const requestId = `sub_${table}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+        const promise = this.waitForSubscribeAck(requestId, key, timeoutMs);
+        pending = { requestId, promise };
+        this.pendingSubscribeByKey.set(key, pending);
+        this.queuedSubscribeRequestIds.set(key, requestId);
+      }
       this.ensureWs();
-      await this.whenConnected(timeoutMs);
-      // Single subscribe send; wait for that requestId's ack.
-      // If this key already had subscribers, still re-send so we get a fresh ack.
-      const requestId = this.sendSubscribe(table, rowId);
-      void isFirst;
-      await this.waitForSubscribeAck(requestId, timeoutMs);
+      if (this.ws?.readyState === 1 && this.queuedSubscribeRequestIds.has(key)) {
+        this.sendSubscribe(table, rowId);
+      }
+      await pending.promise;
       return unsub;
     } catch (err) {
       // Do not leave a half-attached subscription if ack never arrives / errors.
@@ -1319,14 +1336,20 @@ export class LoomupClient<
    */
   private waitForSubscribeAck(
     requestId: string,
+    key: string,
     timeoutMs: number,
   ): Promise<void> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingSubscribeAcks.delete(requestId);
+        if (this.pendingSubscribeByKey.get(key)?.requestId === requestId) {
+          this.pendingSubscribeByKey.delete(key);
+        }
+        this.queuedSubscribeRequestIds.delete(key);
         reject(new Error("subscribe acknowledgement timeout"));
       }, timeoutMs);
       this.pendingSubscribeAcks.set(requestId, {
+        key,
         resolve: () => {
           clearTimeout(timer);
           resolve();
@@ -1343,10 +1366,19 @@ export class LoomupClient<
   private resolveSubscribeAck(data: ControlEvent) {
     const rid = data.requestId;
     if (!rid) return;
+    const requestKey = this.subscribeRequestKeys.get(rid);
+    this.subscribeRequestKeys.delete(rid);
+    if (data.type === "subscribed" && requestKey) {
+      this.acknowledgedSubscriptions.add(requestKey);
+    }
     const pending = this.pendingSubscribeAcks.get(rid);
     if (!pending) return;
     this.pendingSubscribeAcks.delete(rid);
+    if (this.pendingSubscribeByKey.get(pending.key)?.requestId === rid) {
+      this.pendingSubscribeByKey.delete(pending.key);
+    }
     if (data.type === "subscribed") {
+      this.acknowledgedSubscriptions.add(pending.key);
       pending.resolve();
     } else if (data.type === "error") {
       pending.reject(
@@ -1424,6 +1456,10 @@ export class LoomupClient<
     };
     ws.onclose = () => {
       this.ws = undefined;
+      this.acknowledgedSubscriptions.clear();
+      for (const [key, pending] of this.pendingSubscribeByKey) {
+        this.queuedSubscribeRequestIds.set(key, pending.requestId);
+      }
       // Connection did not stay open long enough — keep backoff counter.
       if (this.stableOpenTimer) {
         clearTimeout(this.stableOpenTimer);
@@ -1545,7 +1581,11 @@ export class LoomupClient<
 
   /** Send a subscribe frame; returns the requestId used for ack correlation. */
   private sendSubscribe(table: string, rowId?: string): string {
-    const requestId = `sub_${table}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const key = makeSubKey(table, rowId);
+    const requestId = this.queuedSubscribeRequestIds.get(key)
+      ?? `sub_${table}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    this.queuedSubscribeRequestIds.delete(key);
+    this.subscribeRequestKeys.set(requestId, key);
     this.send({
       type: "subscribe",
       table,
@@ -1599,6 +1639,9 @@ export class LoomupClient<
     this.ws?.close();
     this.ws = undefined;
     this.subs.clear();
+    this.acknowledgedSubscriptions.clear();
+    this.queuedSubscribeRequestIds.clear();
+    this.subscribeRequestKeys.clear();
     this.hasOpenedOnce = false;
     this.reconnectAttempt = 0;
     // Fail any in-flight subscribeReady waiters immediately (don't leave them
@@ -1608,6 +1651,7 @@ export class LoomupClient<
       pending.reject(new Error("realtime closed before subscribe acknowledgement"));
       this.pendingSubscribeAcks.delete(id);
     }
+    this.pendingSubscribeByKey.clear();
   }
 }
 

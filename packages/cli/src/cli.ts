@@ -15,6 +15,7 @@ type LoomupPackageConfig = {
   project?: string;
   schema?: string;
   access?: string;
+  output?: string;
 };
 
 type PackageDocument = Record<string, unknown> & {
@@ -247,7 +248,7 @@ async function ensureStarterAccess(path: string, io: CliIO): Promise<boolean> {
 }
 
 async function initProject(args: string[], cwd: string, io: CliIO): Promise<number> {
-  validateOptions(args, ["--schema", "--access"], []);
+  validateOptions(args, ["--schema", "--access", "--output"], []);
   const packagePath = await findPackageJson(cwd);
   if (!packagePath) {
     throw new CliError("init must run inside a project with package.json", 2);
@@ -258,9 +259,10 @@ async function initProject(args: string[], cwd: string, io: CliIO): Promise<numb
   const schemaPath = resolve(dirname(packagePath), schema);
   const access = option(args, "--access") ?? document.loomup?.access ?? "loomup.access.ts";
   const accessPath = resolve(dirname(packagePath), access);
+  const output = option(args, "--output") ?? document.loomup?.output ?? DEFAULT_CLIENT_PATH;
   const created = await ensureStarterSchema(schemaPath, io);
   const accessCreated = await ensureStarterAccess(accessPath, io);
-  document.loomup = { ...(document.loomup ?? {}), schema, access };
+  document.loomup = { ...(document.loomup ?? {}), schema, access, output };
   await writeFile(packagePath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
   if (!created) io.stdout(`Schema already exists at ${schemaPath}; left it unchanged.`);
   if (!accessCreated) io.stdout(`Access config already exists at ${accessPath}; left it unchanged.`);
@@ -269,6 +271,7 @@ async function initProject(args: string[], cwd: string, io: CliIO): Promise<numb
     projectRoot: dirname(packagePath),
     platformUrl: document.loomup.url,
     projectId: document.loomup.project,
+    outputPath: output,
   });
   io.stdout(`Generated Loomup client at ${generated.outputPath}.`);
   return 0;
@@ -306,6 +309,7 @@ type ResolvedProject = {
   schemaPath: string;
   accessPath?: string;
   packagePath?: string;
+  outputPath: string;
 };
 
 async function resolveProject(args: string[], cwd: string): Promise<ResolvedProject> {
@@ -335,6 +339,7 @@ async function resolveProject(args: string[], cwd: string): Promise<ResolvedProj
     schemaPath: resolve(root, schema),
     accessPath: access ? resolve(root, access) : undefined,
     packagePath,
+    outputPath: config.output ?? DEFAULT_CLIENT_PATH,
   };
 }
 
@@ -389,7 +394,7 @@ async function requestJson<T>(
 }
 
 function printPlan(report: SchemaReport, io: CliIO): void {
-  if (!report.plan.actions.length && !report.plan.blockers.length) {
+  if (!report.plan.actions.length && !report.plan.blockers.length && !report.plan.warnings.length) {
     io.stdout(`Schema is current (${report.schema_sha256.slice(0, 12)}).`);
     return;
   }
@@ -466,6 +471,7 @@ async function migrate(
     projectRoot: project.packagePath ? dirname(project.packagePath) : cwd,
     platformUrl: project.url,
     projectId: project.project,
+    outputPath: project.outputPath,
   });
   if (jsonOutput) {
     io.stdout(JSON.stringify(applied.data, null, 2));
@@ -488,7 +494,7 @@ async function linkProject(
   io: CliIO,
   credentialPath: string,
 ): Promise<number> {
-  validateOptions(args, ["--url", "--project", "--schema", "--access"], []);
+  validateOptions(args, ["--url", "--project", "--schema", "--access", "--output"], []);
   const urlValue = option(args, "--url") ?? process.env.LOOMUP_URL;
   const parsedUrl = urlValue ? parseLoomupUrl(urlValue) : undefined;
   const project =
@@ -510,6 +516,7 @@ async function linkProject(
   const schemaPath = resolve(dirname(packagePath), schema);
   const access = option(args, "--access") ?? document.loomup?.access ?? "loomup.access.ts";
   const accessPath = resolve(dirname(packagePath), access);
+  const output = option(args, "--output") ?? document.loomup?.output ?? DEFAULT_CLIENT_PATH;
   await ensureStarterSchema(schemaPath, io);
   await ensureStarterAccess(accessPath, io);
   const credential = await loomupCredential(credentialPath);
@@ -538,6 +545,7 @@ async function linkProject(
     project,
     schema,
     access,
+    output,
   };
   await writeFile(packagePath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
   const generated = await generateClient({
@@ -545,6 +553,7 @@ async function linkProject(
     projectRoot: dirname(packagePath),
     platformUrl: url,
     projectId: project,
+    outputPath: output,
   });
   io.stdout(`Linked ${basename(dirname(packagePath))} to Loomup project ${project}.`);
   io.stdout(`Generated Loomup client at ${generated.outputPath}.`);
@@ -556,7 +565,7 @@ async function generateProjectClient(
   cwd: string,
   io: CliIO,
 ): Promise<number> {
-  validateOptions(args, ["--schema", "--output"], []);
+  validateOptions(args, ["--schema", "--output"], ["--check"]);
   const packagePath = await findPackageJson(cwd);
   if (!packagePath) {
     throw new CliError("generate must run inside a project with package.json", 2);
@@ -573,9 +582,10 @@ async function generateProjectClient(
     projectRoot,
     platformUrl: parsedUrl?.url,
     projectId,
-    outputPath: option(args, "--output") ?? DEFAULT_CLIENT_PATH,
+    outputPath: option(args, "--output") ?? document.loomup?.output ?? DEFAULT_CLIENT_PATH,
+    check: flag(args, "--check"),
   });
-  io.stdout(`Generated Loomup client at ${generated.outputPath}.`);
+  io.stdout(`${flag(args, "--check") ? "Verified" : "Generated"} Loomup client at ${generated.outputPath}.`);
   return 0;
 }
 
@@ -822,10 +832,10 @@ function usage(io: CliIO): void {
   loomup project-keys create --project <id> --name <name> --scope <scope>... [--json]
   loomup project-keys list --project <id> [--json]
   loomup project-keys revoke --project <id> --id <key-id>
-  loomup init [--schema <path>] [--access <path>]
-  loomup generate [--schema <path>] [--output <path>]
+  loomup init [--schema <path>] [--access <path>] [--output <path>]
+  loomup generate [--schema <path>] [--output <path>] [--check]
   loomup migrate [--plan] [--allow-data-loss] [--json] [--schema <path>] [--access <path>]
-  loomup link --url <project-url> --project <project-id> [--schema <path>] [--access <path>]
+  loomup link --url <project-url> --project <project-id> [--schema <path>] [--access <path>] [--output <path>]
 
 Platform authentication and provisioning always use ${PLATFORM_URL}.`);
 }
