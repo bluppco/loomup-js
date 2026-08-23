@@ -144,7 +144,7 @@ jobs:
         run: |
           for package in client astro cli; do
             name="@loomup/${package}"
-            tarball="npm-tarballs/loomup-${package}-${VERSION}.tgz"
+            tarball="./npm-tarballs/loomup-${package}-${VERSION}.tgz"
             if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
               echo "${name}@${VERSION} already exists; skipping publication."
             else
