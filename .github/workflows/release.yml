@@ -174,25 +174,9 @@ jobs:
           name: npm-tarballs-${{ needs.prepare.outputs.version }}
           path: npm-tarballs
 
-      - name: Select publication channel
-        id: release
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
-            npm config set //registry.npmjs.org/:_authToken="$NODE_AUTH_TOKEN"
-            echo "publish_tag=next" >> "$GITHUB_OUTPUT"
-            echo "promote=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish_tag=latest" >> "$GITHUB_OUTPUT"
-            echo "promote=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish in dependency order
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
-          PUBLISH_TAG: ${{ steps.release.outputs.publish_tag }}
         run: |
           for package in client offline react vue next nuxt tanstack-query react-native astro cli; do
             name="@loomup/${package}"
@@ -201,7 +185,7 @@ jobs:
             if curl --fail --silent --output /dev/null "$version_url"; then
               echo "${name}@${VERSION} already exists; skipping publication."
             else
-              npm publish "$tarball" --access public --tag "$PUBLISH_TAG" --provenance
+              npm publish "$tarball" --access public --tag latest --provenance
             fi
           done
 
@@ -255,13 +239,3 @@ jobs:
           NODE
           test -f node_modules/@loomup/offline/dist/sql-wasm.wasm
           ./node_modules/.bin/loomup --help
-
-      - name: Promote bootstrap release to latest
-        if: steps.release.outputs.promote == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          for package in client offline react vue next nuxt tanstack-query react-native astro cli; do
-            npm dist-tag add "@loomup/${package}@${VERSION}" latest
-          done
