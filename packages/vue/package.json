@@ -1,6 +1,6 @@
 {
   "name": "@loomup/vue",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Vue 3 composables and plugin for Loomup Realtime",
   "type": "module",
   "main": "dist/index.js",
@@ -25,7 +25,7 @@
     "vue": ">=3.3"
   },
   "devDependencies": {
-    "@loomup/client": "0.1.6",
+    "@loomup/client": "0.1.7",
     "@types/jsdom": "^28.0.3",
     "@types/node": "^22.0.0",
     "jsdom": "^26.0.0",

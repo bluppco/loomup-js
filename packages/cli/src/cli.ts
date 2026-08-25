@@ -45,6 +45,41 @@ type SchemaReport = {
   rollback_snapshot?: { id?: string };
 };
 
+type DataListMeta = {
+  limit: number;
+  offset: number;
+  total: number;
+  truncated?: boolean;
+  next_cursor?: string;
+};
+
+type DataListResponse = {
+  data: Record<string, unknown>[];
+  meta: DataListMeta;
+};
+
+type DataAccess = {
+  kind: "manager" | "project_key";
+  token: string;
+};
+
+type DataResourceInfo = {
+  name: string;
+  fields: number;
+  source: "managed" | "discovered";
+};
+
+type ProjectOperation = {
+  id: string;
+  project_id: string;
+  kind: string;
+  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  stage: string;
+  result?: SchemaReport;
+  error_code?: string;
+  error_message?: string;
+};
+
 type AppIntegrityMode = "off" | "audit" | "enforce";
 
 type AppIntegrityApp = {
@@ -450,9 +485,11 @@ async function requestJson<T>(
   init?: RequestInit,
 ): Promise<T> {
   let response: Response;
+  const timeout = AbortSignal.timeout(30_000);
   try {
     response = await fetch(url, {
       ...init,
+      signal: init?.signal ?? timeout,
       headers: {
         Accept: "application/json",
         ...(init?.body ? { "Content-Type": "application/json" } : {}),
@@ -476,6 +513,55 @@ async function requestJson<T>(
     throw new CliError(`Loomup ${response.status}: ${String(message)}`, code);
   }
   return body as T;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function isProjectOperation(value: unknown): value is ProjectOperation {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      typeof (value as ProjectOperation).id === "string" &&
+      typeof (value as ProjectOperation).state === "string" &&
+      typeof (value as ProjectOperation).stage === "string",
+  );
+}
+
+async function waitForProjectOperation(
+  platformUrl: string,
+  projectId: string,
+  operation: ProjectOperation,
+  token: string,
+  io: CliIO,
+  jsonOutput: boolean,
+): Promise<SchemaReport> {
+  const endpoint = `${platformUrl}/platform/api/projects/${encodeURIComponent(projectId)}/operations/${encodeURIComponent(operation.id)}`;
+  const deadline = Date.now() + 150_000;
+  let current = operation;
+  let reportedStage = "";
+  while (current.state === "queued" || current.state === "running") {
+    if (!jsonOutput && current.stage !== reportedStage) {
+      io.stderr(`Schema operation ${current.stage}…`);
+      reportedStage = current.stage;
+    }
+    if (Date.now() >= deadline) {
+      throw new CliError(
+        `schema operation ${current.id} did not finish within 150 seconds; inspect it at ${endpoint}`,
+      );
+    }
+    await delay(500);
+    const response = await requestJson<ApiEnvelope<ProjectOperation>>(endpoint, token);
+    current = response.data;
+  }
+  if (current.state === "succeeded" && current.result) return current.result;
+  if (current.state === "cancelled") {
+    throw new CliError(`schema operation ${current.id} was cancelled`);
+  }
+  throw new CliError(
+    `schema operation ${current.id} failed${current.error_code ? ` (${current.error_code})` : ""}: ${current.error_message ?? "unknown error"}`,
+  );
 }
 
 async function fetchWorkspaces(platformUrl: string, token: string): Promise<Workspace[]> {
@@ -620,8 +706,9 @@ async function migrate(
     }
     return 2;
   }
-  const applied = await requestJson<ApiEnvelope<SchemaReport>>(endpoint, token, {
+  const submitted = await requestJson<ApiEnvelope<SchemaReport | ProjectOperation>>(endpoint, token, {
     method: "POST",
+    headers: { Prefer: "respond-async" },
     body: JSON.stringify({
       schema,
       compiled_access: compiledAccess,
@@ -629,6 +716,16 @@ async function migrate(
       allow_data_loss: allowDataLoss,
     }),
   });
+  const applied = isProjectOperation(submitted.data)
+    ? await waitForProjectOperation(
+        project.url,
+        project.project,
+        submitted.data,
+        token,
+        io,
+        jsonOutput,
+      )
+    : submitted.data;
   const generated = await generateClient({
     schemaPath: project.schemaPath,
     projectRoot: project.packagePath ? dirname(project.packagePath) : cwd,
@@ -637,14 +734,14 @@ async function migrate(
     outputPath: project.outputPath,
   });
   if (jsonOutput) {
-    io.stdout(JSON.stringify(applied.data, null, 2));
-  } else if (!applied.data.applied) {
-    io.stdout(`Schema is current (${applied.data.schema_sha256.slice(0, 12)}).`);
+    io.stdout(JSON.stringify(applied, null, 2));
+  } else if (!applied.applied) {
+    io.stdout(`Schema is current (${applied.schema_sha256.slice(0, 12)}).`);
   } else {
-    printPlan(applied.data, io);
-    io.stdout(`Applied schema revision ${applied.data.revision}.`);
-    if (applied.data.rollback_snapshot?.id) {
-      io.stdout(`Rollback snapshot: ${applied.data.rollback_snapshot.id}`);
+    printPlan(applied, io);
+    io.stdout(`Applied schema revision ${applied.revision}.`);
+    if (applied.rollback_snapshot?.id) {
+      io.stdout(`Rollback snapshot: ${applied.rollback_snapshot.id}`);
     }
   }
   if (!jsonOutput) io.stdout(`Generated Loomup client at ${generated.outputPath}.`);
@@ -753,6 +850,487 @@ async function linkProject(
     );
   }
   await persistProjectLink(target, url, project, io);
+  return 0;
+}
+
+function requiredArgument(args: string[], index: number, label: string): string {
+  const value = args[index]?.trim();
+  if (!value || value.startsWith("--")) {
+    throw new CliError(`${label} is required`, 2);
+  }
+  return value;
+}
+
+function validateResourceName(resource: string): void {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(resource) || resource.startsWith("_")) {
+    throw new CliError(
+      "resource must start with a letter and contain only letters, numbers, and underscores",
+      2,
+    );
+  }
+}
+
+function assignment(value: string, optionName: string): { name: string; value: string } {
+  const separator = value.indexOf("=");
+  if (separator <= 0) {
+    throw new CliError(`${optionName} must use <field>=<value>`, 2);
+  }
+  return { name: value.slice(0, separator), value: value.slice(separator + 1) };
+}
+
+function nonNegativeIntegerOption(args: string[], name: string): number | undefined {
+  const raw = option(args, name);
+  if (raw === undefined) return undefined;
+  if (!/^\d+$/.test(raw)) throw new CliError(`${name} must be a non-negative integer`, 2);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) {
+    throw new CliError(`${name} must be a non-negative safe integer`, 2);
+  }
+  return value;
+}
+
+const dataFilterOperators: Record<string, string> = {
+  eq: "eq",
+  ne: "ne",
+  lt: "lt",
+  lte: "lte",
+  gt: "gt",
+  gte: "gte",
+  in: "in",
+  isNull: "is_null",
+  is_null: "is_null",
+  contains: "contains",
+  startsWith: "starts_with",
+  starts_with: "starts_with",
+};
+
+function appendDataFilters(params: URLSearchParams, args: string[]): void {
+  for (const raw of options(args, "--where")) {
+    const item = assignment(raw, "--where");
+    const value = item.value === "true" ? "1" : item.value === "false" ? "0" : item.value;
+    params.set(`where[${item.name}]`, value);
+  }
+  for (const raw of options(args, "--filter")) {
+    const item = assignment(raw, "--filter");
+    const separator = item.name.lastIndexOf(".");
+    if (separator <= 0 || separator === item.name.length - 1) {
+      throw new CliError(
+        "--filter must use <field>.<operator>=<value>",
+        2,
+      );
+    }
+    const field = item.name.slice(0, separator);
+    const requestedOperator = item.name.slice(separator + 1);
+    const operator = dataFilterOperators[requestedOperator];
+    if (!operator) {
+      throw new CliError(
+        `unknown filter operator ${JSON.stringify(requestedOperator)}; use eq, ne, lt, lte, gt, gte, in, isNull, contains, or startsWith`,
+        2,
+      );
+    }
+    params.set(`filter[${field}][${operator}]`, item.value);
+  }
+}
+
+async function resolveDataProject(
+  args: string[],
+  cwd: string,
+  platformUrl: string,
+): Promise<ResolvedProject> {
+  const packagePath = await findPackageJson(cwd);
+  const packageDocument = packagePath ? await readPackage(packagePath) : undefined;
+  const config = packageDocument?.loomup ?? {};
+  const urlValue = option(args, "--url") ?? process.env.LOOMUP_URL ?? config.url;
+  const parsedUrl = urlValue ? parseLoomupUrl(urlValue) : parseLoomupUrl(platformUrl);
+  const project =
+    option(args, "--project") ??
+    process.env.LOOMUP_PROJECT_ID ??
+    config.project ??
+    parsedUrl.project;
+  if (!project) {
+    throw new CliError(
+      "project is required; run inside a linked package or pass --project <project-id>",
+      2,
+    );
+  }
+  const root = packagePath ? dirname(packagePath) : cwd;
+  const schema = process.env.LOOMUP_SCHEMA ?? config.schema ?? "loomup.schema.yaml";
+  return {
+    url: parsedUrl.url,
+    project,
+    schemaPath: resolve(root, schema),
+    accessPath: undefined,
+    packagePath,
+    outputPath: config.output ?? DEFAULT_CLIENT_PATH,
+  };
+}
+
+async function resolveDataAccess(
+  project: ResolvedProject,
+  platformUrl: string,
+  credentialPath: string,
+  forceProjectKey: boolean,
+): Promise<DataAccess> {
+  const legacyToken = process.env.LOOMUP_PLATFORM_TOKEN?.trim();
+  const projectKey =
+    process.env.LOOMUP_API_KEY?.trim() ||
+    (legacyToken?.startsWith("loomup_sk_") ? legacyToken : undefined);
+  if (forceProjectKey) {
+    if (projectKey) return { kind: "project_key", token: projectKey };
+    throw new CliError(
+      "--use-project-key requires LOOMUP_API_KEY with resource:<name>:read or project:backend permission",
+      2,
+    );
+  }
+  if (cleanUrl(project.url) === cleanUrl(platformUrl)) {
+    const managerToken =
+      legacyToken && !legacyToken.startsWith("loomup_sk_")
+        ? legacyToken
+        : await readStoredCredential(credentialPath);
+    if (managerToken) return { kind: "manager", token: managerToken };
+  }
+  if (projectKey) return { kind: "project_key", token: projectKey };
+  throw new CliError(
+    "not authenticated; run `loomup auth login` or set LOOMUP_API_KEY with Resource read permission",
+    2,
+  );
+}
+
+function projectGatewayUrl(project: ResolvedProject): string {
+  return `${project.url.replace(/\/$/, "")}/p/${encodeURIComponent(project.project)}`;
+}
+
+function dataCollectionUrl(
+  project: ResolvedProject,
+  access: DataAccess,
+  resource: string,
+): string {
+  if (access.kind === "project_key") {
+    return `${projectGatewayUrl(project)}/api/${encodeURIComponent(resource)}`;
+  }
+  return `${project.url}/platform/api/projects/${encodeURIComponent(project.project)}/studio/resources/${encodeURIComponent(resource)}/records`;
+}
+
+async function fetchDataPage(
+  project: ResolvedProject,
+  access: DataAccess,
+  resource: string,
+  params: URLSearchParams,
+): Promise<DataListResponse> {
+  const query = params.toString();
+  return requestJson<DataListResponse>(
+    `${dataCollectionUrl(project, access, resource)}${query ? `?${query}` : ""}`,
+    access.token,
+  );
+}
+
+function dataValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function truncateCell(value: string, width = 36): string {
+  return value.length <= width ? value : `${value.slice(0, width - 1)}…`;
+}
+
+function printTable(rows: Record<string, unknown>[], io: CliIO): void {
+  if (!rows.length) {
+    io.stdout("No records found.");
+    return;
+  }
+  const allColumns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+  const columns = allColumns.slice(0, 8);
+  const widths = columns.map((column) =>
+    Math.max(
+      column.length,
+      ...rows.map((row) => truncateCell(dataValue(row[column])).length),
+    ),
+  );
+  io.stdout(columns.map((column, index) => column.padEnd(widths[index]!)).join("  "));
+  io.stdout(widths.map((width) => "-".repeat(width)).join("  "));
+  for (const row of rows) {
+    io.stdout(
+      columns
+        .map((column, index) => truncateCell(dataValue(row[column])).padEnd(widths[index]!))
+        .join("  "),
+    );
+  }
+  if (allColumns.length > columns.length) {
+    io.stderr(
+      `Showing ${columns.length} of ${allColumns.length} fields; use --select, --json, or --jsonl for the rest.`,
+    );
+  }
+}
+
+function printDataList(resource: string, result: DataListResponse, io: CliIO): void {
+  printTable(result.data, io);
+  io.stdout(
+    `Showing ${result.data.length} of ${result.meta.total} record(s) (offset ${result.meta.offset}).`,
+  );
+  if (result.meta.truncated) {
+    io.stderr("The total is a lower bound because the server scan limit was reached.");
+  }
+  if (result.meta.next_cursor) {
+    io.stdout(`Next: loomup data list ${resource} --cursor ${result.meta.next_cursor}`);
+  }
+}
+
+function validateDataOutput(args: string[]): void {
+  if (flag(args, "--json") && flag(args, "--jsonl")) {
+    throw new CliError("--json and --jsonl cannot be combined", 2);
+  }
+}
+
+async function fetchAllData(
+  project: ResolvedProject,
+  access: DataAccess,
+  resource: string,
+  baseParams: URLSearchParams,
+): Promise<DataListResponse> {
+  const first = await fetchDataPage(project, access, resource, baseParams);
+  const data = [...first.data];
+  let current = first;
+  let truncated = Boolean(first.meta.truncated);
+  while (true) {
+    let nextParams: URLSearchParams | undefined;
+    if (access.kind === "project_key" && current.meta.next_cursor) {
+      nextParams = new URLSearchParams({ cursor: current.meta.next_cursor });
+    } else if (access.kind === "manager") {
+      const nextOffset = current.meta.offset + current.data.length;
+      if (!current.data.length || nextOffset >= current.meta.total) break;
+      nextParams = new URLSearchParams(baseParams);
+      nextParams.set("offset", String(nextOffset));
+    }
+    if (!nextParams) break;
+    current = await fetchDataPage(project, access, resource, nextParams);
+    data.push(...current.data);
+    truncated ||= Boolean(current.meta.truncated);
+  }
+  return {
+    data,
+    meta: {
+      ...first.meta,
+      total: current.meta.total,
+      truncated: truncated || undefined,
+      next_cursor: undefined,
+    },
+  };
+}
+
+async function listProjectData(
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  const resource = requiredArgument(args, 0, "resource");
+  validateResourceName(resource);
+  const commandArgs = args.slice(1);
+  validateOptions(
+    commandArgs,
+    ["--url", "--project", "--where", "--filter", "--select", "--sort", "--limit", "--offset", "--cursor"],
+    ["--all", "--json", "--jsonl", "--use-project-key"],
+  );
+  validateDataOutput(commandArgs);
+  const cursor = option(commandArgs, "--cursor");
+  if (
+    cursor &&
+    ["--where", "--filter", "--select", "--sort", "--limit", "--offset"].some((name) =>
+      commandArgs.some((argument) => argument === name || argument.startsWith(`${name}=`)),
+    )
+  ) {
+    throw new CliError(
+      "--cursor cannot be combined with filters, sort, select, limit, or offset",
+      2,
+    );
+  }
+  const project = await resolveDataProject(commandArgs, cwd, platformUrl);
+  const access = await resolveDataAccess(
+    project,
+    platformUrl,
+    credentialPath,
+    flag(commandArgs, "--use-project-key") || Boolean(cursor),
+  );
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
+  else {
+    appendDataFilters(params, commandArgs);
+    const selected = options(commandArgs, "--select").flatMap((value) => value.split(","));
+    if (selected.length) params.set("select", selected.join(","));
+    const sort = option(commandArgs, "--sort");
+    if (sort) params.set("sort", sort);
+    const limit = nonNegativeIntegerOption(commandArgs, "--limit");
+    const offset = nonNegativeIntegerOption(commandArgs, "--offset");
+    if (limit !== undefined) params.set("limit", String(limit));
+    if (offset !== undefined) params.set("offset", String(offset));
+  }
+  const response = flag(commandArgs, "--all")
+    ? await fetchAllData(project, access, resource, params)
+    : await fetchDataPage(project, access, resource, params);
+  if (flag(commandArgs, "--json")) io.stdout(JSON.stringify(response, null, 2));
+  else if (flag(commandArgs, "--jsonl")) {
+    for (const record of response.data) io.stdout(JSON.stringify(record));
+  } else printDataList(resource, response, io);
+  return 0;
+}
+
+async function countProjectData(
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  const resource = requiredArgument(args, 0, "resource");
+  validateResourceName(resource);
+  const commandArgs = args.slice(1);
+  validateOptions(
+    commandArgs,
+    ["--url", "--project", "--where", "--filter"],
+    ["--json", "--use-project-key"],
+  );
+  const project = await resolveDataProject(commandArgs, cwd, platformUrl);
+  const access = await resolveDataAccess(
+    project,
+    platformUrl,
+    credentialPath,
+    flag(commandArgs, "--use-project-key"),
+  );
+  const params = new URLSearchParams({ limit: "1" });
+  appendDataFilters(params, commandArgs);
+  const response = await fetchDataPage(project, access, resource, params);
+  if (flag(commandArgs, "--json")) io.stdout(JSON.stringify(response.meta, null, 2));
+  else io.stdout(String(response.meta.total));
+  if (response.meta.truncated) {
+    io.stderr("The count is a lower bound because the server scan limit was reached.");
+  }
+  return 0;
+}
+
+async function getProjectData(
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  const resource = requiredArgument(args, 0, "resource");
+  const id = requiredArgument(args, 1, "record id");
+  validateResourceName(resource);
+  const commandArgs = args.slice(2);
+  validateOptions(
+    commandArgs,
+    ["--url", "--project"],
+    ["--json", "--jsonl", "--use-project-key"],
+  );
+  validateDataOutput(commandArgs);
+  const project = await resolveDataProject(commandArgs, cwd, platformUrl);
+  const access = await resolveDataAccess(
+    project,
+    platformUrl,
+    credentialPath,
+    flag(commandArgs, "--use-project-key"),
+  );
+  const response = await requestJson<{ data: Record<string, unknown> }>(
+    `${dataCollectionUrl(project, access, resource)}/${encodeURIComponent(id)}`,
+    access.token,
+  );
+  if (flag(commandArgs, "--json")) io.stdout(JSON.stringify(response, null, 2));
+  else if (flag(commandArgs, "--jsonl")) io.stdout(JSON.stringify(response.data));
+  else io.stdout(JSON.stringify(response.data, null, 2));
+  return 0;
+}
+
+async function discoverProjectResources(
+  project: ResolvedProject,
+  access: DataAccess,
+): Promise<DataResourceInfo[]> {
+  if (access.kind !== "manager") {
+    throw new CliError(
+      "resource discovery requires `loomup auth login`; project keys can still use data list, count, and get",
+      2,
+    );
+  }
+  const response = await requestJson<ApiEnvelope<{
+    manifest?: { resources?: Record<string, { fields?: Record<string, unknown> }> };
+    discovered_resources?: Array<{ name: string; columns?: unknown[] }>;
+    archived_resources?: string[];
+  }>>(
+    `${project.url}/platform/api/projects/${encodeURIComponent(project.project)}/studio/schema`,
+    access.token,
+  );
+  const managed = response.data.manifest?.resources ?? {};
+  const discovered = new Map(
+    (response.data.discovered_resources ?? []).map((resource) => [resource.name, resource]),
+  );
+  const archived = new Set(response.data.archived_resources ?? []);
+  const names = new Set([...Object.keys(managed), ...discovered.keys()]);
+  return [...names]
+    .filter((name) => !archived.has(name))
+    .sort()
+    .map((name) => ({
+      name,
+      fields: managed[name]?.fields
+        ? Object.keys(managed[name]!.fields!).length
+        : discovered.get(name)?.columns?.length ?? 0,
+      source: Object.prototype.hasOwnProperty.call(managed, name) ? "managed" : "discovered",
+    }));
+}
+
+async function listProjectResources(
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--url", "--project"], ["--json", "--jsonl"]);
+  validateDataOutput(args);
+  const project = await resolveDataProject(args, cwd, platformUrl);
+  const access = await resolveDataAccess(project, platformUrl, credentialPath, false);
+  const resources = await discoverProjectResources(project, access);
+  if (flag(args, "--json")) io.stdout(JSON.stringify(resources, null, 2));
+  else if (flag(args, "--jsonl")) {
+    for (const resource of resources) io.stdout(JSON.stringify(resource));
+  } else printTable(resources.map((resource) => ({ ...resource })), io);
+  return 0;
+}
+
+async function summarizeProjectData(
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--url", "--project"], ["--json"]);
+  const project = await resolveDataProject(args, cwd, platformUrl);
+  const access = await resolveDataAccess(project, platformUrl, credentialPath, false);
+  const resources = await discoverProjectResources(project, access);
+  const summary: Array<Record<string, unknown>> = [];
+  for (const resource of resources) {
+    const result = await fetchDataPage(
+      project,
+      access,
+      resource.name,
+      new URLSearchParams({ limit: "1" }),
+    );
+    summary.push({
+      resource: resource.name,
+      records: result.meta.total,
+      fields: resource.fields,
+      source: resource.source,
+      count: result.meta.truncated ? "lower bound" : "exact",
+    });
+  }
+  if (flag(args, "--json")) {
+    io.stdout(JSON.stringify({ project: project.project, resources: summary }, null, 2));
+  } else {
+    io.stdout(`Project ${project.project}`);
+    printTable(summary, io);
+  }
   return 0;
 }
 
@@ -1372,6 +1950,11 @@ function usage(io: CliIO): void {
   loomup workspaces create --name <name> [--json]
   loomup projects create --name <name> [--workspace <id>] [--template <name>] [--link] [--json]
   loomup projects list [--workspace <id>] [--json]
+  loomup data resources [--project <id>] [--url <url>] [--json|--jsonl]
+  loomup data summary [--project <id>] [--url <url>] [--json]
+  loomup data list <resource> [--where <field>=<value>]... [--filter <field>.<operator>=<value>]... [--select <fields>] [--sort <spec>] [--limit <n>] [--offset <n>] [--cursor <token>] [--all] [--project <id>] [--url <url>] [--json|--jsonl] [--use-project-key]
+  loomup data count <resource> [--where <field>=<value>]... [--filter <field>.<operator>=<value>]... [--project <id>] [--url <url>] [--json] [--use-project-key]
+  loomup data get <resource> <record-id> [--project <id>] [--url <url>] [--json|--jsonl] [--use-project-key]
   loomup project-keys create [--project <id>] --name <name> --scope <scope>... [--json]
   loomup project-keys list [--project <id>] [--json]
   loomup project-keys revoke [--project <id>] --id <key-id>
@@ -1428,6 +2011,16 @@ export async function runCli(
       );
     if (args[0] === "projects" && args[1] === "list")
       return await listHostedProjects(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "data" && args[1] === "resources")
+      return await listProjectResources(args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "data" && args[1] === "summary")
+      return await summarizeProjectData(args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "data" && args[1] === "list")
+      return await listProjectData(args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "data" && args[1] === "count")
+      return await countProjectData(args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "data" && args[1] === "get")
+      return await getProjectData(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "project-keys" && args[1] === "create")
       return await createProjectKey(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "project-keys" && args[1] === "list")

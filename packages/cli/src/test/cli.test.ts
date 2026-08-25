@@ -102,6 +102,85 @@ test("migrate prefers the project API key and never prints it", async () => {
   assert.ok(!generated.includes("loomup_sk_project_deployer"));
 });
 
+test("migrate submits an async operation and polls its durable result", async () => {
+  let applyPrefer = "";
+  let polls = 0;
+  const report = {
+    project_id: "project-async",
+    schema_sha256: "abcdef1234567890",
+    revision: 2,
+    applied: true,
+    plan: { actions: [], blockers: [], warnings: [] },
+  };
+  const server = createServer((request, response) => {
+    if (request.method === "GET" && request.url?.endsWith("/operations/operation-1")) {
+      polls += 1;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(
+        JSON.stringify({
+          data: {
+            id: "operation-1",
+            project_id: "project-async",
+            kind: "project_schema_migration",
+            state: "succeeded",
+            stage: "completed",
+            result: report,
+          },
+        }),
+      );
+      return;
+    }
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      const parsed = JSON.parse(body);
+      response.writeHead(parsed.dry_run ? 200 : 202, { "Content-Type": "application/json" });
+      if (parsed.dry_run) {
+        response.end(JSON.stringify({ data: { ...report, revision: 1, applied: false } }));
+      } else {
+        applyPrefer = String(request.headers.prefer ?? "");
+        response.end(
+          JSON.stringify({
+            data: {
+              id: "operation-1",
+              project_id: "project-async",
+              kind: "project_schema_migration",
+              state: "queued",
+              stage: "queued",
+            },
+          }),
+        );
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-async-"));
+  await writeFile(
+    join(directory, "package.json"),
+    JSON.stringify({
+      loomup: {
+        url: `http://127.0.0.1:${address.port}`,
+        project: "project-async",
+        schema: "loomup.schema.yaml",
+      },
+    }),
+  );
+  await writeFile(join(directory, "loomup.schema.yaml"), "todos:\n  title: text\n");
+  process.env.LOOMUP_API_KEY = "loomup_sk_async";
+  const logs = output();
+  try {
+    assert.equal(await runCli(["migrate"], { cwd: directory, io: logs.io }), 0);
+  } finally {
+    server.close();
+  }
+  assert.equal(applyPrefer, "respond-async");
+  assert.equal(polls, 1);
+  assert.ok(logs.stdout.some((line) => line.includes("Applied schema revision 2")));
+  assert.ok(logs.stderr.some((line) => line.includes("queued")));
+});
+
 test("destructive plans stop before apply without the explicit flag", async () => {
   let requests = 0;
   const server = createServer((request, response) => {
@@ -314,6 +393,218 @@ test("credentials cannot be supplied as a command-line option", async () => {
     2,
   );
   assert.ok(logs.stderr.join("\n").includes("LOOMUP_API_KEY"));
+});
+
+test("data commands query the linked project with client-compatible filters and metadata", async () => {
+  const requests: Array<{ path: string; authorization?: string }> = [];
+  const server = createServer((request, response) => {
+    requests.push({
+      path: request.url ?? "",
+      authorization: request.headers.authorization,
+    });
+    request.resume();
+    request.on("end", () => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      if (request.url?.startsWith("/p/project-data/api/issues/issue_123")) {
+        response.end(JSON.stringify({ data: { id: "issue_123", title: "Fix CLI" } }));
+        return;
+      }
+      const url = new URL(request.url ?? "", "http://localhost");
+      if (url.searchParams.get("limit") === "1") {
+        response.end(JSON.stringify({
+          data: [{ id: "issue_123" }],
+          meta: { limit: 1, offset: 0, total: 7, truncated: true },
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        data: [
+          { id: "issue_123", title: "Fix CLI" },
+          { id: "issue_124", title: "Fix docs" },
+        ],
+        meta: { limit: 2, offset: 3, total: 7, next_cursor: "next.page" },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-data-"));
+  await writeFile(join(directory, "package.json"), JSON.stringify({
+    loomup: {
+      url: `http://127.0.0.1:${address.port}`,
+      project: "project-data",
+    },
+  }));
+  process.env.LOOMUP_API_KEY = "loomup_sk_data_reader";
+  const listLogs = output();
+  const countLogs = output();
+  const getLogs = output();
+  try {
+    assert.equal(await runCli([
+      "data", "list", "issues",
+      "--where", "status=open",
+      "--where", "archived=false",
+      "--filter", "priority.gte=2",
+      "--filter", "title.startsWith=Fix",
+      "--select", "id,title",
+      "--sort", "-created_at",
+      "--limit", "2",
+      "--offset", "3",
+      "--json",
+    ], { cwd: directory, io: listLogs.io }), 0);
+    assert.equal(await runCli([
+      "data", "count", "issues", "--where", "status=open", "--json",
+    ], { cwd: directory, io: countLogs.io }), 0);
+    assert.equal(await runCli([
+      "data", "get", "issues", "issue_123", "--json",
+    ], { cwd: directory, io: getLogs.io }), 0);
+  } finally {
+    server.close();
+  }
+
+  assert.equal(requests.length, 3);
+  assert.ok(requests.every((request) => request.authorization === "Bearer loomup_sk_data_reader"));
+  const listUrl = new URL(requests[0]!.path, "http://localhost");
+  assert.equal(listUrl.pathname, "/p/project-data/api/issues");
+  assert.equal(listUrl.searchParams.get("where[status]"), "open");
+  assert.equal(listUrl.searchParams.get("where[archived]"), "0");
+  assert.equal(listUrl.searchParams.get("filter[priority][gte]"), "2");
+  assert.equal(listUrl.searchParams.get("filter[title][starts_with]"), "Fix");
+  assert.equal(listUrl.searchParams.get("select"), "id,title");
+  assert.equal(listUrl.searchParams.get("sort"), "-created_at");
+  assert.equal(listUrl.searchParams.get("limit"), "2");
+  assert.equal(listUrl.searchParams.get("offset"), "3");
+  assert.equal(JSON.parse(listLogs.stdout.join("\n")).meta.total, 7);
+  assert.equal(JSON.parse(countLogs.stdout.join("\n")).total, 7);
+  assert.ok(countLogs.stderr.join("\n").includes("lower bound"));
+  assert.equal(JSON.parse(getLogs.stdout.join("\n")).data.id, "issue_123");
+});
+
+test("logged-in data debugging defaults to hosted manager access and discovers project Resources", async () => {
+  const requests: Array<{ path: string; authorization?: string }> = [];
+  const server = createServer((request, response) => {
+    requests.push({ path: request.url ?? "", authorization: request.headers.authorization });
+    request.resume();
+    request.on("end", () => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      const url = new URL(request.url ?? "", "http://localhost");
+      if (url.pathname.endsWith("/studio/schema")) {
+        response.end(JSON.stringify({ data: {
+          manifest: { resources: { issues: { fields: { title: {}, status: {} } } } },
+          discovered_resources: [
+            { name: "issues", columns: [{ name: "id" }, { name: "title" }, { name: "status" }] },
+            { name: "logs", columns: [{ name: "id" }, { name: "message" }] },
+          ],
+          archived_resources: ["archived_notes"],
+        } }));
+        return;
+      }
+      if (url.pathname.endsWith("/records/issue_1")) {
+        response.end(JSON.stringify({ data: { id: "issue_1", title: "First", status: "open" } }));
+        return;
+      }
+      if (url.pathname.includes("/resources/logs/records")) {
+        response.end(JSON.stringify({
+          data: [{ id: "log_1", message: "ready" }],
+          meta: { limit: 1, offset: 0, total: 5 },
+        }));
+        return;
+      }
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      const filtered = url.searchParams.get("where[status]") === "open";
+      const rows = filtered
+        ? [
+            { id: "issue_1", title: "First", status: "open" },
+            { id: "issue_2", title: "Second", status: "open" },
+            { id: "issue_3", title: "Third", status: "open" },
+          ]
+        : [{ id: "issue_1", title: "First", status: "open" }];
+      const limit = Number(url.searchParams.get("limit") ?? 50);
+      response.end(JSON.stringify({
+        data: rows.slice(offset, offset + limit),
+        meta: { limit, offset, total: filtered ? 3 : 7 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-manager-data-"));
+  await writeFile(join(directory, "package.json"), JSON.stringify({ name: "manager-data" }));
+  process.env.LOOMUP_PLATFORM_TOKEN = "human-session";
+  delete process.env.LOOMUP_API_KEY;
+  const resourcesLogs = output();
+  const summaryLogs = output();
+  const listLogs = output();
+  const tableLogs = output();
+  const getLogs = output();
+  try {
+    assert.equal(await runCli([
+      "data", "resources", "--project", "project-manager", "--json",
+    ], { cwd: directory, io: resourcesLogs.io, platformUrl }), 0);
+    assert.equal(await runCli([
+      "data", "summary", "--project", "project-manager", "--json",
+    ], { cwd: directory, io: summaryLogs.io, platformUrl }), 0);
+    assert.equal(await runCli([
+      "data", "list", "issues", "--project", "project-manager",
+      "--where", "status=open", "--limit", "2", "--all", "--json",
+    ], { cwd: directory, io: listLogs.io, platformUrl }), 0);
+    assert.equal(await runCli([
+      "data", "list", "issues", "--project", "project-manager", "--limit", "1",
+    ], { cwd: directory, io: tableLogs.io, platformUrl }), 0);
+    assert.equal(await runCli([
+      "data", "get", "issues", "issue_1", "--project", "project-manager", "--jsonl",
+    ], { cwd: directory, io: getLogs.io, platformUrl }), 0);
+  } finally {
+    server.close();
+  }
+
+  const resources = JSON.parse(resourcesLogs.stdout.join("\n"));
+  assert.deepEqual(resources.map((resource: { name: string }) => resource.name), ["issues", "logs"]);
+  const summary = JSON.parse(summaryLogs.stdout.join("\n"));
+  assert.deepEqual(
+    summary.resources.map((resource: { resource: string; records: number }) => [resource.resource, resource.records]),
+    [["issues", 7], ["logs", 5]],
+  );
+  assert.equal(JSON.parse(listLogs.stdout.join("\n")).data.length, 3);
+  assert.ok(tableLogs.stdout[0]?.includes("id"));
+  assert.ok(tableLogs.stdout.some((line) => line.includes("Showing 1 of 7")));
+  assert.equal(JSON.parse(getLogs.stdout.join("\n")).id, "issue_1");
+  assert.ok(requests.every((request) => request.authorization === "Bearer human-session"));
+  assert.ok(requests.every((request) => request.path.startsWith("/platform/api/projects/project-manager/studio/")));
+  assert.equal(
+    requests.filter((request) => request.path.includes("where%5Bstatus%5D=open")).length,
+    2,
+    "--all should continue the filtered manager query by offset",
+  );
+});
+
+test("data commands reject unsafe or ambiguous queries before making a request", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-data-validation-"));
+  await writeFile(join(directory, "package.json"), JSON.stringify({
+    loomup: { url: "https://tryloomup.com", project: "project-data" },
+  }));
+  process.env.LOOMUP_API_KEY = "loomup_sk_data_reader";
+
+  const cursorLogs = output();
+  assert.equal(await runCli([
+    "data", "list", "issues", "--cursor", "next.page", "--limit", "20",
+  ], { cwd: directory, io: cursorLogs.io }), 2);
+  assert.ok(cursorLogs.stderr.join("\n").includes("--cursor cannot be combined"));
+
+  const filterLogs = output();
+  assert.equal(await runCli([
+    "data", "list", "issues", "--filter", "priority.unknown=2",
+  ], { cwd: directory, io: filterLogs.io }), 2);
+  assert.ok(filterLogs.stderr.join("\n").includes("unknown filter operator"));
+
+  const resourceLogs = output();
+  assert.equal(await runCli([
+    "data", "list", "_secrets",
+  ], { cwd: directory, io: resourceLogs.io }), 2);
+  assert.ok(resourceLogs.stderr.join("\n").includes("resource must start"));
 });
 
 test("platform authentication rejects every public URL override", async () => {

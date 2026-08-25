@@ -1,5 +1,11 @@
 # @loomup/cli
 
+Schema apply is submitted as a durable asynchronous project operation. The CLI
+polls until it succeeds or fails, so closing the original HTTP connection does
+not strand an apply or leave the project indefinitely in maintenance. Each
+poll request has a 30-second network timeout and the command reports the
+operation URL if the 150-second command budget expires.
+
 Declare a Loomup project's tables, fields, types, defaults, and indexes in YAML.
 Loomup derives and safely reconciles the database schema; application developers
 do not write migration SQL.
@@ -34,6 +40,37 @@ With several workspaces, an interactive terminal prompts for one; scripts must
 pass `--workspace <workspace-id>`. Without `--link`, the CLI prints the exact
 `loomup link` command to run next. `npx loomup projects list` lists projects from
 all accessible workspaces; `--workspace` filters the result.
+
+Use the logged-in manager session to inspect a linked project without opening
+Studio or creating another credential:
+
+```bash
+npx loomup data resources
+npx loomup data summary
+npx loomup data list issues --where status=open --limit 20
+npx loomup data list issues --filter priority.gte=2 --sort=-created_at --all
+npx loomup data count issues --where status=open
+npx loomup data get issues issue_123
+```
+
+List output is an adaptive terminal table. Use `--json` for the client-compatible
+`{ data, meta }` envelope, `--jsonl` for pipelines, and `--all` to follow every
+page automatically. `data summary` shows record and field counts across all
+live Resources; `data resources` provides discovery without reading records.
+
+`--where <field>=<value>` is equality shorthand. Rich filters use
+`--filter <field>.<operator>=<value>` with `eq`, `ne`, `lt`, `lte`, `gt`, `gte`,
+`in`, `isNull`, `contains`, or `startsWith`; both options can be repeated.
+`--select` accepts comma-separated fields. JSON metadata includes `meta.total`,
+`meta.truncated`, and any `meta.next_cursor`.
+
+By default, hosted data commands use the session saved by `loomup auth login`.
+Pass `--use-project-key` with `LOOMUP_API_KEY` to reproduce the exact
+`resource:<name>:read` or `project:backend` authorization used by application
+code. A project key is also the fallback for self-hosted projects. Outside a
+linked package, `--project <project-id>` is enough for tryloomup.com; add
+`--url <platform-url>` only for another host. Resource discovery and the
+cross-Resource summary require a logged-in manager session.
 
 Logged-in project managers can configure native App Attest and Play Integrity
 identities without editing the hosted manifest directly:
