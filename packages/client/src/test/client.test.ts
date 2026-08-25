@@ -37,10 +37,41 @@ describe("createClient", () => {
     assert.equal(typeof c.auth.register, "function");
     assert.equal(typeof c.auth.logout, "function");
     assert.equal(typeof c.auth.refresh, "function");
+    assert.equal(typeof c.auth.oauthProviders, "function");
+    assert.equal(typeof c.auth.authorizeOAuth, "function");
+    assert.equal(typeof c.auth.exchangeOAuthCode, "function");
     assert.equal(typeof c.users.find, "function");
     assert.equal(typeof c.users.get, "function");
     assert.equal(typeof c.files.from("avatars").find, "function");
     assert.equal(typeof c.files.from("avatars").create, "function");
+  });
+
+  it("maps OAuth authorize and exchange and applies the session", async () => {
+    const calls: Array<{ url: string; body?: string }> = [];
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: init?.body as string | undefined });
+      if (String(input).endsWith("/auth/oauth/providers")) {
+        return new Response(JSON.stringify({ data: [{ provider: "google", configured: true, callback_url: "https://api.test/auth/oauth/callback/google" }] }), { status: 200 });
+      }
+      if (String(input).endsWith("/auth/oauth/authorize")) {
+        return new Response(JSON.stringify({ data: { authorization_url: "https://accounts.test/auth", code_verifier: "verifier", expires_in: 600 } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: { access_token: "access", refresh_token: "refresh", token_type: "Bearer", expires_in: 900, user: { id: "u1", email: "a@b.com", role: "user", disabled: false, created_at: 1 } } }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const client = createClient({ url: "https://api.test" });
+      assert.equal((await client.auth.oauthProviders())[0]?.provider, "google");
+      const authorization = await client.auth.authorizeOAuth({ provider: "google", redirectTo: "com.app://auth/callback" });
+      assert.equal(authorization.code_verifier, "verifier");
+      const tokens = await client.auth.exchangeOAuthCode({ code: "handoff", codeVerifier: authorization.code_verifier });
+      assert.equal(tokens.user?.id, "u1");
+      assert.equal(client.accessToken, "access");
+      assert.deepEqual(JSON.parse(calls[1]?.body ?? "{}"), { provider: "google", redirect_to: "com.app://auth/callback" });
+      assert.deepEqual(JSON.parse(calls[2]?.body ?? "{}"), { code: "handoff", code_verifier: "verifier" });
+    } finally {
+      globalThis.fetch = previous;
+    }
   });
 
   it("select encodes boolean where filters as 0/1", async () => {

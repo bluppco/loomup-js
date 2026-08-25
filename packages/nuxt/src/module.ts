@@ -51,6 +51,8 @@ export default defineNuxtModule<ModuleOptions>({
       options.exposeAccessToken !== false;
     nuxt.options.runtimeConfig.loomupSkewSeconds =
       options.skewSeconds ?? 60;
+    nuxt.options.runtimeConfig.loomupOAuthCallbackUrl = options.oauthCallbackUrl;
+    nuxt.options.runtimeConfig.loomupServiceKey = options.serviceKey;
 
     nuxt.options.runtimeConfig.public = nuxt.options.runtimeConfig.public || {};
     const pub = nuxt.options.runtimeConfig.public as Record<string, unknown>;
@@ -114,6 +116,16 @@ export default defineNuxtModule<ModuleOptions>({
       addServerHandler({
         route: `${authBase}/session`,
         handler: resolver.resolve("./runtime/server/routes/session.get.js"),
+        method: "get",
+      });
+      addServerHandler({
+        route: `${authBase}/oauth/start`,
+        handler: resolver.resolve("./runtime/server/routes/oauth-start.post.js"),
+        method: "post",
+      });
+      addServerHandler({
+        route: `${authBase}/oauth/callback`,
+        handler: resolver.resolve("./runtime/server/routes/oauth-callback.get.js"),
         method: "get",
       });
     }

@@ -47,6 +47,30 @@ export type AuthTokens = {
   user?: User;
 };
 
+export type OAuthProvider = "google" | "apple" | "github";
+
+export type OAuthProviderInfo = {
+  provider: OAuthProvider;
+  configured: boolean;
+  callback_url: string;
+};
+
+export type OAuthAuthorization = {
+  authorization_url: string;
+  code_verifier: string;
+  expires_in: number;
+};
+
+export type OAuthAuthorizeInput = {
+  provider: OAuthProvider;
+  redirectTo: string;
+};
+
+export type OAuthExchangeInput = {
+  code: string;
+  codeVerifier: string;
+};
+
 export type User = {
   id: string;
   email: string;
@@ -653,6 +677,9 @@ export class LoomupClient<
       /** Login (alias: login). */
       signIn: (creds: { email: string; password: string }) => this.signIn(creds),
       login: (creds: { email: string; password: string }) => this.signIn(creds),
+      oauthProviders: () => this.oauthProviders(),
+      authorizeOAuth: (input: OAuthAuthorizeInput) => this.authorizeOAuth(input),
+      exchangeOAuthCode: (input: OAuthExchangeInput) => this.exchangeOAuthCode(input),
       signOut: () => this.signOut(),
       logout: () => this.signOut(),
       me: () => this.me(),
@@ -1109,6 +1136,35 @@ export class LoomupClient<
     });
     this.applyTokens(res.data);
     return res.data;
+  }
+
+  async oauthProviders(): Promise<OAuthProviderInfo[]> {
+    const response = await this.request<{ data: OAuthProviderInfo[] }>(
+      "GET",
+      "/auth/oauth/providers",
+    );
+    return response.data;
+  }
+
+  async authorizeOAuth(input: OAuthAuthorizeInput): Promise<OAuthAuthorization> {
+    const response = await this.request<{ data: OAuthAuthorization }>(
+      "POST",
+      "/auth/oauth/authorize",
+      { provider: input.provider, redirect_to: input.redirectTo },
+      { skipRetry: true },
+    );
+    return response.data;
+  }
+
+  async exchangeOAuthCode(input: OAuthExchangeInput): Promise<AuthTokens> {
+    const response = await this.request<{ data: AuthTokens }>(
+      "POST",
+      "/auth/oauth/exchange",
+      { code: input.code, code_verifier: input.codeVerifier },
+      { skipRetry: true },
+    );
+    this.applyTokens(response.data);
+    return response.data;
   }
 
   async me(): Promise<User> {

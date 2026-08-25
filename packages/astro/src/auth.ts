@@ -1,6 +1,6 @@
 /** Same-origin Astro auth endpoint for Loomup-backed applications. */
 
-import { LoomupError, type User } from "@loomup/client";
+import { LoomupError, type OAuthProvider, type User } from "@loomup/client";
 import { readTokens, writeTokens } from "./cookies.js";
 import {
   createServerClient,
@@ -18,13 +18,24 @@ export type LoomupAuthEndpointContext = {
 export type LoomupAuthHandlerOptions = CreateServerClientOptions & {
   /** Catch-all Astro parameter name. Default: `loomup`. */
   param?: string;
+  /** Exact application callback URL allowlisted in `$auth.redirect_urls`. */
+  oauthCallbackUrl?: string;
 };
+
+const OAUTH_VERIFIER_COOKIE = "loomup-oauth-verifier";
+const OAUTH_RETURN_COOKIE = "loomup-oauth-return";
 
 function response(data: unknown, status = 200): Response {
   return Response.json(data, {
     status,
     headers: { "Cache-Control": "private, no-store" },
   });
+}
+
+function localErrorRedirect(returnTo: string, error: string): string {
+  const destination = new URL(returnTo, "http://loomup.local");
+  destination.searchParams.set("error", error);
+  return `${destination.pathname}${destination.search}${destination.hash}`;
 }
 
 async function jsonBody(request: Request): Promise<Record<string, unknown>> {
@@ -87,10 +98,11 @@ async function upstreamRequest<T>(
   path: string,
   body?: unknown,
   accessToken?: string,
+  serviceKey?: string,
 ): Promise<{ data: T; response: Response }> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  if (accessToken || serviceKey) headers.Authorization = `Bearer ${accessToken ?? serviceKey}`;
   const upstream = await fetch(joinUrl(baseUrl, path), {
     method,
     headers,
@@ -137,6 +149,8 @@ async function authExchange(
     "POST",
     path,
     body,
+    undefined,
+    options.client?.serviceKey,
   );
   const accessToken =
     typeof data.access_token === "string"
@@ -326,6 +340,61 @@ export function createLoomupAuthHandler(options: LoomupAuthHandlerOptions = {}) 
         return await proxyToLoomup(context, options, url, action);
       }
       switch (action) {
+        case "oauth/start": {
+          assertSameOrigin(context.request);
+          if (!options.oauthCallbackUrl) {
+            throw new LoomupError("oauthCallbackUrl is required", "oauth_misconfigured", 500);
+          }
+          const body = await jsonBody(context.request);
+          const provider = String(body.provider ?? "");
+          if (!["google", "apple", "github"].includes(provider)) {
+            throw new LoomupError("supported OAuth provider required", "invalid_input", 400);
+          }
+          const requestedReturn = String(body.returnTo ?? "/");
+          const returnTo = requestedReturn.startsWith("/") && !requestedReturn.startsWith("//")
+            ? requestedReturn
+            : "/";
+          const loomup = (await import("@loomup/client")).createClient({
+            url,
+            serviceKey: options.client?.serviceKey,
+          });
+          const authorization = await loomup.auth.authorizeOAuth({
+            provider: provider as OAuthProvider,
+            redirectTo: options.oauthCallbackUrl,
+          });
+          const secure = options.cookies?.secure ?? process.env.NODE_ENV === "production";
+          const cookieOptions = { path: "/", httpOnly: true, sameSite: "lax" as const, secure, maxAge: 600 };
+          context.cookies.set(OAUTH_VERIFIER_COOKIE, authorization.code_verifier, cookieOptions);
+          context.cookies.set(OAUTH_RETURN_COOKIE, encodeURIComponent(returnTo), cookieOptions);
+          return new Response(null, { status: 302, headers: { Location: authorization.authorization_url } });
+        }
+        case "oauth/callback": {
+          const callback = new URL(context.request.url);
+          const code = callback.searchParams.get("code");
+          const providerError = callback.searchParams.get("error");
+          const verifier = context.cookies.get(OAUTH_VERIFIER_COOKIE)?.value;
+          const encodedReturn = context.cookies.get(OAUTH_RETURN_COOKIE)?.value;
+          let returnTo = "/";
+          try {
+            const candidate = decodeURIComponent(encodedReturn ?? "/");
+            if (candidate.startsWith("/") && !candidate.startsWith("//")) returnTo = candidate;
+          } catch { /* default */ }
+          if (providerError && verifier) {
+            context.cookies.delete(OAUTH_VERIFIER_COOKIE, { path: "/" });
+            context.cookies.delete(OAUTH_RETURN_COOKIE, { path: "/" });
+            return new Response(null, { status: 302, headers: { Location: localErrorRedirect(returnTo, providerError) } });
+          }
+          if (!code || !verifier) {
+            throw new LoomupError("OAuth callback is incomplete", "oauth_flow_expired", 400);
+          }
+          await authExchange(url, context.cookies, options, "/auth/oauth/exchange", {
+            code,
+            code_verifier: verifier,
+          });
+          context.cookies.delete(OAUTH_VERIFIER_COOKIE, { path: "/" });
+          context.cookies.delete(OAUTH_RETURN_COOKIE, { path: "/" });
+          return new Response(null, { status: 302, headers: { Location: returnTo } });
+        }
         case "session": {
           if (context.request.method !== "GET") {
             return response({ error: { code: "method_not_allowed" } }, 405);

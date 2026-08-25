@@ -103,4 +103,36 @@ describe("createAuthHandlers", () => {
     assert.equal(res.status, 200);
     assert.deepEqual(res.body, { data: { user: null, session: null } });
   });
+
+  it("completes OAuth with transient cookies and relays stable errors", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/auth/oauth/authorize")) {
+        return Response.json({ data: { authorization_url: "https://accounts.test/authorize", code_verifier: "nuxt-verifier", expires_in: 600 } });
+      }
+      return new Response(JSON.stringify(authPayload()), { status: 200 });
+    }) as typeof fetch;
+    const handlers = createAuthHandlers({
+      url: "https://api.test",
+      oauthCallbackUrl: "https://app.test/api/auth/oauth/callback",
+    });
+    const cookies = mockCookies();
+    const start = await handlers.oauthStart({ provider: "google", returnTo: "/account" }, { cookies });
+    assert.equal(start.location, "https://accounts.test/authorize");
+    assert.equal(cookies.jar.get("loomup-oauth-verifier"), "nuxt-verifier");
+    const callback = await handlers.oauthCallback("handoff", undefined, { cookies });
+    assert.equal(callback.location, "/account");
+    assert.equal(cookies.jar.get(DEFAULT_ACCESS_COOKIE), "access-1");
+
+    const deniedCookies = mockCookies({
+      "loomup-oauth-verifier": "v",
+      "loomup-oauth-return": encodeURIComponent("/login"),
+    });
+    const denied = await handlers.oauthCallback(undefined, "registration_disabled", { cookies: deniedCookies });
+    assert.equal(denied.location, "/login?error=registration_disabled");
+    assert.equal(deniedCookies.jar.has("loomup-oauth-verifier"), false);
+
+    const unsolicited = await handlers.oauthCallback(undefined, "registration_disabled", { cookies: mockCookies() });
+    assert.equal(unsolicited.status, 400);
+    assert.equal((unsolicited.body as { error: { code: string } }).error.code, "oauth_flow_expired");
+  });
 });

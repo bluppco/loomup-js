@@ -18,6 +18,8 @@ export type LoomupRuntimeConfig = {
   loomupCookies?: SessionCookieOptions;
   loomupExposeAccessToken?: boolean;
   loomupSkewSeconds?: number;
+  loomupOAuthCallbackUrl?: string;
+  loomupServiceKey?: string;
   public?: { loomupUrl?: string };
 };
 
@@ -67,6 +69,8 @@ export function getLoomupServerContext(event: H3Event) {
     exposeAccessToken: config.loomupExposeAccessToken !== false,
     cookieAdapter: cookieAdapter(),
     skewSeconds: config.loomupSkewSeconds ?? 60,
+    oauthCallbackUrl: config.loomupOAuthCallbackUrl,
+    serviceKey: config.loomupServiceKey,
   };
 }
 
@@ -87,6 +91,8 @@ export function authHandlers(event: H3Event) {
     cookieOptions: ctx.cookieOptions,
     exposeAccessToken: ctx.exposeAccessToken,
     cookieAdapter: ctx.cookieAdapter,
+    oauthCallbackUrl: ctx.oauthCallbackUrl,
+    serviceKey: ctx.serviceKey,
   });
 }
 

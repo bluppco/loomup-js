@@ -6,6 +6,9 @@ import type {
   DefaultUpdateMap,
   ListMeta,
   LoomupClient,
+  OAuthAuthorization,
+  OAuthAuthorizeInput,
+  OAuthExchangeInput,
   User,
 } from "@loomup/client";
 import {
@@ -210,6 +213,30 @@ export function createLoomupQuery<
                   if (data.user) {
                     queryClient.setQueryData(loomupKeys.me(), data.user);
                   }
+                },
+              }
+            : {}),
+          ...overrides,
+        };
+      },
+
+      authorizeOAuthOptions(overrides?: Record<string, unknown>) {
+        return {
+          mutationFn: (input: OAuthAuthorizeInput): Promise<OAuthAuthorization> =>
+            client.auth.authorizeOAuth(input),
+          ...overrides,
+        };
+      },
+
+      exchangeOAuthOptions(opts?: MutationCacheOptions & Record<string, unknown>) {
+        const { queryClient, ...overrides } = opts ?? {};
+        return {
+          mutationFn: (input: OAuthExchangeInput): Promise<AuthTokens> =>
+            client.auth.exchangeOAuthCode(input),
+          ...(queryClient
+            ? {
+                onSuccess: (data: AuthTokens) => {
+                  if (data.user) queryClient.setQueryData(loomupKeys.me(), data.user);
                 },
               }
             : {}),

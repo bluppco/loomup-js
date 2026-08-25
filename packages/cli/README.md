@@ -20,6 +20,29 @@ npx loomup auth status
 npx loomup auth logout
 ```
 
+Logged-in project managers can configure native App Attest and Play Integrity
+identities without editing the hosted manifest directly:
+
+```bash
+npx loomup app-integrity set-ios --project <project-id> --app-id ios_main \
+  --team-id ABCDE12345 --bundle-id com.example.app --apple-app-id 1234567890
+
+npx loomup app-integrity set-android --project <project-id> --app-id android_main \
+  --package-name com.example.app --cloud-project-number 123456789012 \
+  --certificate-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+npx loomup app-integrity put-google-credential --project <project-id> \
+  --file ./google-play-integrity.json
+npx loomup app-integrity set-mode --project <project-id> --mode audit
+npx loomup app-integrity status --project <project-id>
+```
+
+Start in `audit` before enabling `enforce`. Use `--allow-development` only for
+a separate development identity. These commands require `loomup auth login` or
+`LOOMUP_PLATFORM_TOKEN`; workspace and project API keys cannot change the
+mobile security policy. Credential contents are sent write-only and never
+printed or persisted by the CLI.
+
 Workspace API keys provide non-human control-plane automation without granting
 direct access to project data. Create one in **Workspace API keys**, then use it
 from CI to provision projects and issue project keys within its delegation

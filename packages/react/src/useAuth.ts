@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import type { AuthTokens, User } from "@loomup/client";
+import { LoomupError, type AuthTokens, type OAuthProvider, type User } from "@loomup/client";
 import { useLoomupContext } from "./context.js";
 import { clearTokens, loadTokens, saveTokens } from "./storage.js";
 import { errorMessage } from "./utils.js";
@@ -16,6 +16,8 @@ export type UseAuthResult = {
   error: string | null;
   signIn: (creds: { email: string; password: string }) => Promise<AuthTokens>;
   signUp: (creds: { email: string; password: string }) => Promise<AuthTokens>;
+  signInWithOAuth: (provider: OAuthProvider, redirectTo: string) => Promise<void>;
+  completeOAuthSignIn: (callbackUrl?: string) => Promise<AuthTokens>;
   signOut: () => Promise<void>;
   refresh: () => Promise<AuthTokens>;
   me: () => Promise<User>;
@@ -173,6 +175,52 @@ export function useAuth(): UseAuthResult {
     }
   }, [client, persist.enabled, persist.storage, persist.storageKey]);
 
+  const signInWithOAuth = useCallback(
+    async (provider: OAuthProvider, redirectTo: string) => {
+      setError(null);
+      const authorization = await client.auth.authorizeOAuth({ provider, redirectTo });
+      if (typeof globalThis.sessionStorage === "undefined") {
+        throw new Error("OAuth sign-in requires browser sessionStorage");
+      }
+      globalThis.sessionStorage.setItem("loomup:oauth:code-verifier", authorization.code_verifier);
+      globalThis.location.assign(authorization.authorization_url);
+    },
+    [client],
+  );
+
+  const completeOAuthSignIn = useCallback(
+    async (callbackUrl = globalThis.location?.href) => {
+      setError(null);
+      setLoading(true);
+      try {
+        if (!callbackUrl || typeof globalThis.sessionStorage === "undefined") {
+          throw new LoomupError("OAuth callback URL or verifier is unavailable", "oauth_callback_incomplete");
+        }
+        const callback = new URL(callbackUrl);
+        const providerError = callback.searchParams.get("error");
+        if (providerError) {
+          globalThis.sessionStorage.removeItem("loomup:oauth:code-verifier");
+          throw new LoomupError(`OAuth sign-in failed: ${providerError}`, providerError);
+        }
+        const code = callback.searchParams.get("code");
+        const codeVerifier = globalThis.sessionStorage.getItem("loomup:oauth:code-verifier");
+        if (!code || !codeVerifier) {
+          throw new LoomupError("OAuth callback is incomplete", "oauth_callback_incomplete");
+        }
+        const tokens = await client.auth.exchangeOAuthCode({ code, codeVerifier });
+        globalThis.sessionStorage.removeItem("loomup:oauth:code-verifier");
+        await applyTokens(tokens);
+        return tokens;
+      } catch (err) {
+        setError(errorMessage(err));
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [client, applyTokens],
+  );
+
   const refresh = useCallback(async () => {
     setError(null);
     const tokens = await client.auth.refresh();
@@ -194,6 +242,8 @@ export function useAuth(): UseAuthResult {
     error,
     signIn,
     signUp,
+    signInWithOAuth,
+    completeOAuthSignIn,
     signOut,
     refresh,
     me,

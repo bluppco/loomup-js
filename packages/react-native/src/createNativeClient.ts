@@ -17,7 +17,11 @@ import {
   type LoomupClient,
 } from "@loomup/client";
 
-export type CreateNativeClientOptions = CreateClientOptions;
+/**
+ * Mobile-safe client options. Service keys are trusted-backend credentials and
+ * are intentionally impossible to pass through the React Native factory.
+ */
+export type CreateNativeClientOptions = Omit<CreateClientOptions, "serviceKey">;
 
 /**
  * Create a Loomup client for React Native.

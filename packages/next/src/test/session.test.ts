@@ -338,4 +338,63 @@ describe("createAuthRouteHandlers", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("keeps the OAuth verifier in HttpOnly cookies and installs the session", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/auth/oauth/authorize")) {
+        assert.deepEqual(JSON.parse(String(init?.body)), {
+          provider: "github",
+          redirect_to: "https://app.test/api/auth/oauth/callback",
+        });
+        return Response.json({ data: { authorization_url: "https://github.test/authorize", code_verifier: "verifier-1", expires_in: 600 } });
+      }
+      if (url.endsWith("/auth/oauth/exchange")) {
+        assert.deepEqual(JSON.parse(String(init?.body)), { code: "handoff-1", code_verifier: "verifier-1" });
+        return Response.json({ data: { access_token: "oauth-a", refresh_token: "oauth-r", token_type: "Bearer", expires_in: 900, user: { id: "u1", email: "a@b.com", role: "user", disabled: false, created_at: 1 } } });
+      }
+      return new Response("no", { status: 404 });
+    }) as typeof fetch;
+    try {
+      const handlers = createAuthRouteHandlers({
+        url: "https://api.test",
+        oauthCallbackUrl: "https://app.test/api/auth/oauth/callback",
+      });
+      const start = await handlers.oauthStart(new Request("https://app.test/api/auth/oauth/start", {
+        method: "POST",
+        body: JSON.stringify({ provider: "github", returnTo: "/settings" }),
+      }));
+      assert.equal(start.status, 302);
+      assert.equal(start.headers.get("location"), "https://github.test/authorize");
+      assert.ok(getSetCookieHeaders(start).some((value) => value.includes("loomup-oauth-verifier=verifier-1") && value.includes("HttpOnly")));
+
+      const callback = await handlers.oauthCallback(new Request("https://app.test/api/auth/oauth/callback?code=handoff-1", {
+        headers: { cookie: "loomup-oauth-verifier=verifier-1; loomup-oauth-return=%2Fsettings" },
+      }));
+      assert.equal(callback.status, 302);
+      assert.equal(callback.headers.get("location"), "/settings");
+      const cookies = getSetCookieHeaders(callback);
+      assert.ok(cookies.some((value) => value.includes("loomup-access=oauth-a")));
+      assert.ok(cookies.some((value) => value.includes("loomup-oauth-verifier=") && value.includes("Max-Age=0")));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("redirects stable provider errors to the local return path", async () => {
+    const handlers = createAuthRouteHandlers({
+      url: "https://api.test",
+      oauthCallbackUrl: "https://app.test/api/auth/oauth/callback",
+    });
+    const callback = await handlers.oauthCallback(new Request("https://app.test/api/auth/oauth/callback?error=registration_disabled", {
+      headers: { cookie: "loomup-oauth-verifier=v; loomup-oauth-return=%2Flogin" },
+    }));
+    assert.equal(callback.status, 302);
+    assert.equal(callback.headers.get("location"), "/login?error=registration_disabled");
+
+    const unsolicited = await handlers.oauthCallback(new Request("https://app.test/api/auth/oauth/callback?error=registration_disabled"));
+    assert.equal(unsolicited.status, 400);
+    assert.equal(((await unsolicited.json()) as { error: { code: string } }).error.code, "oauth_flow_expired");
+  });
 });

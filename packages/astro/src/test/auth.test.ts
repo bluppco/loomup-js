@@ -236,4 +236,17 @@ describe("createLoomupAuthHandler", () => {
     });
     assert.equal(result.status, 403);
   });
+
+  it("does not relay an unsolicited OAuth provider error", async () => {
+    const result = await createLoomupAuthHandler({
+      url: "https://project.example",
+      oauthCallbackUrl: "https://app.example/api/loomup/oauth/callback",
+    })({
+      cookies: cookies(),
+      params: { loomup: "oauth/callback" },
+      request: new Request("https://app.example/api/loomup/oauth/callback?error=registration_disabled"),
+    });
+    assert.equal(result.status, 400);
+    assert.equal(((await result.json()) as { error: { code: string } }).error.code, "oauth_flow_expired");
+  });
 });

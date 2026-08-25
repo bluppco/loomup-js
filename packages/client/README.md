@@ -35,6 +35,29 @@ unsubscribe();
 loomup.closeRealtime();
 ```
 
+Social login uses a one-use code plus a client-held verifier:
+
+```ts
+const authorization = await loomup.auth.authorizeOAuth({
+  provider: "google", // or "apple" / "github"
+  redirectTo: "https://app.example.com/auth/callback",
+});
+sessionStorage.setItem("loomup-oauth-verifier", authorization.code_verifier);
+location.assign(authorization.authorization_url);
+
+// On the registered callback route:
+const code = new URL(location.href).searchParams.get("code")!;
+await loomup.auth.exchangeOAuthCode({
+  code,
+  codeVerifier: sessionStorage.getItem("loomup-oauth-verifier")!,
+});
+```
+
+React and Vue expose `signInWithOAuth` and `completeOAuthSignIn`. Next, Nuxt,
+and Astro include server-owned start/callback handlers so the verifier remains
+in an HttpOnly transient cookie. React Native exports `signInWithOAuth` with an
+app-provided secure browser/deep-link launcher.
+
 Browsers and modern runtimes provide `WebSocket` globally. In older Node.js
 runtimes, pass a compatible implementation through `WebSocketImpl` when using
 realtime subscriptions.

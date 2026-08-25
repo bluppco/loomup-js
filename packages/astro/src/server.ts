@@ -10,6 +10,8 @@ import {
   type CreateClientOptions,
   type DefaultTableMap,
   type LoomupProject,
+  type OAuthAuthorizeInput,
+  type OAuthExchangeInput,
 } from "@loomup/client";
 
 import {
@@ -157,6 +159,12 @@ export class ServerLoomupClient<
     return data;
   }
 
+  override async exchangeOAuthCode(input: OAuthExchangeInput): Promise<AuthTokens> {
+    const data = await super.exchangeOAuthCode(input);
+    this.persistFromTokens(data);
+    return data;
+  }
+
   override async signOut(): Promise<void> {
     await super.signOut();
     this.clearCookieTokens();
@@ -198,6 +206,9 @@ export class ServerLoomupClient<
         this.signIn(creds),
       login: (creds: { email: string; password: string }) =>
         this.signIn(creds),
+      oauthProviders: () => this.oauthProviders(),
+      authorizeOAuth: (input: OAuthAuthorizeInput) => this.authorizeOAuth(input),
+      exchangeOAuthCode: (input: OAuthExchangeInput) => this.exchangeOAuthCode(input),
       signOut: () => this.signOut(),
       logout: () => this.signOut(),
       me: () => this.me(),

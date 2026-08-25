@@ -4,6 +4,8 @@
 
 export { createNativeClient } from "./createNativeClient.js";
 export type { CreateNativeClientOptions } from "./createNativeClient.js";
+export { signInWithOAuth } from "./oauth.js";
+export type { NativeOAuthSignInOptions, OAuthSessionLauncher } from "./oauth.js";
 
 export { LoomupNativeProvider } from "./provider.js";
 export type {

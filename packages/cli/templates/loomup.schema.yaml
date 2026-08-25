@@ -17,6 +17,10 @@
 # $auth:
 #   registration: disabled # or public
 #   password_reset_url: https://app.example.com/reset-password
+#   providers: [google, apple, github]
+#   redirect_urls:
+#     - https://app.example.com/auth/callback
+#     - com.example.app:/auth/callback
 # $email:
 #   from: hello@app.example.com
 #   name: Example App

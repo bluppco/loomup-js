@@ -7,6 +7,7 @@
 import {
   createClient,
   type AuthTokens,
+  type OAuthProvider,
   type User,
 } from "@loomup/client";
 import {
@@ -22,7 +23,14 @@ export type AuthRouteHandlersOptions = {
   cookieOptions?: SessionCookieOptions;
   /** When true, session JSON includes access_token for client hydrate (default true). */
   exposeAccessToken?: boolean;
+  /** Exact application callback URL allowlisted in `$auth.redirect_urls`. */
+  oauthCallbackUrl?: string;
+  /** Optional trusted backend key, useful when app integrity is enforced. */
+  serviceKey?: string;
 };
+
+const OAUTH_VERIFIER_COOKIE = "loomup-oauth-verifier";
+const OAUTH_RETURN_COOKIE = "loomup-oauth-return";
 
 function cookieHeaderToJar(
   header: string | null,
@@ -66,6 +74,34 @@ function jsonError(message: string, status: number, code?: string): Response {
   );
 }
 
+function oauthCookie(name: string, value: string, options: AuthRouteHandlersOptions, maxAge = 600): CookieRecord {
+  return {
+    name,
+    value,
+    options: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: options.cookieOptions?.secure ?? process.env.NODE_ENV === "production",
+      path: "/",
+      maxAge,
+    },
+  };
+}
+
+function redirectResponse(location: string, cookies: CookieRecord[]): Response {
+  const headers = new Headers({ Location: location });
+  for (const cookie of cookies) {
+    headers.append("Set-Cookie", serializeCookie(cookie.name, cookie.value, cookie.options ?? {}));
+  }
+  return new Response(null, { status: 302, headers });
+}
+
+function localErrorRedirect(returnTo: string, error: string): string {
+  const destination = new URL(returnTo, "http://loomup.local");
+  destination.searchParams.set("error", error);
+  return `${destination.pathname}${destination.search}${destination.hash}`;
+}
+
 async function readJson(
   request: Request,
 ): Promise<Record<string, unknown> | null> {
@@ -84,6 +120,71 @@ async function readJson(
 export function createAuthRouteHandlers(options: AuthRouteHandlersOptions) {
   const exposeAccess = options.exposeAccessToken !== false;
   const base = options.url.replace(/\/$/, "");
+
+  async function oauthStart(request: Request): Promise<Response> {
+    if (!options.oauthCallbackUrl) {
+      return jsonError("oauthCallbackUrl is required", 500, "oauth_misconfigured");
+    }
+    const body = await readJson(request);
+    const provider = body?.provider;
+    if (!(["google", "apple", "github"] as unknown[]).includes(provider)) {
+      return jsonError("supported OAuth provider required", 400, "bad_request");
+    }
+    const requestedReturn = typeof body?.returnTo === "string" ? body.returnTo : "/";
+    const returnTo = requestedReturn.startsWith("/") && !requestedReturn.startsWith("//")
+      ? requestedReturn
+      : "/";
+    try {
+      const client = createClient({ url: base, serviceKey: options.serviceKey });
+      const authorization = await client.auth.authorizeOAuth({
+        provider: provider as OAuthProvider,
+        redirectTo: options.oauthCallbackUrl,
+      });
+      return redirectResponse(authorization.authorization_url, [
+        oauthCookie(OAUTH_VERIFIER_COOKIE, authorization.code_verifier, options),
+        oauthCookie(OAUTH_RETURN_COOKIE, encodeURIComponent(returnTo), options),
+      ]);
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "OAuth start failed", 400, "oauth_start_failed");
+    }
+  }
+
+  async function oauthCallback(request: Request): Promise<Response> {
+    const callback = new URL(request.url);
+    const code = callback.searchParams.get("code");
+    const providerError = callback.searchParams.get("error");
+    const jar = cookieHeaderToJar(request.headers.get("cookie"));
+    const verifier = jar.find((cookie) => cookie.name === OAUTH_VERIFIER_COOKIE)?.value;
+    const returnCookie = jar.find((cookie) => cookie.name === OAUTH_RETURN_COOKIE)?.value;
+    const returnTo = (() => {
+      try {
+        const value = decodeURIComponent(returnCookie ?? "/");
+        return value.startsWith("/") && !value.startsWith("//") ? value : "/";
+      } catch {
+        return "/";
+      }
+    })();
+    if (providerError && verifier) {
+      return redirectResponse(localErrorRedirect(returnTo, providerError), [
+        oauthCookie(OAUTH_VERIFIER_COOKIE, "", options, 0),
+        oauthCookie(OAUTH_RETURN_COOKIE, "", options, 0),
+      ]);
+    }
+    if (!code || !verifier) {
+      return jsonError("OAuth callback is incomplete", 400, "oauth_flow_expired");
+    }
+    try {
+      const client = createClient({ url: base, serviceKey: options.serviceKey });
+      const tokens = await client.auth.exchangeOAuthCode({ code, codeVerifier: verifier });
+      return redirectResponse(returnTo, [
+        ...sessionCookiesFromTokens(tokens, options.cookieOptions),
+        oauthCookie(OAUTH_VERIFIER_COOKIE, "", options, 0),
+        oauthCookie(OAUTH_RETURN_COOKIE, "", options, 0),
+      ]);
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "OAuth callback failed", 401, "oauth_exchange_failed");
+    }
+  }
 
   async function login(request: Request): Promise<Response> {
     const body = await readJson(request);
@@ -232,7 +333,7 @@ export function createAuthRouteHandlers(options: AuthRouteHandlersOptions) {
     }
   }
 
-  return { login, register, logout, refresh, session };
+  return { login, register, logout, refresh, session, oauthStart, oauthCallback };
 }
 
 function publicSession(

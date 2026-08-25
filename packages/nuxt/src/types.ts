@@ -70,4 +70,8 @@ export type ModuleOptions = {
    * client can hydrate Bearer for REST + realtime (refresh stays HttpOnly).
    */
   exposeAccessToken?: boolean;
+  /** Exact application callback URL allowlisted in `$auth.redirect_urls`. */
+  oauthCallbackUrl?: string;
+  /** Optional trusted server-only key for app-integrity-enforced projects. */
+  serviceKey?: string;
 };

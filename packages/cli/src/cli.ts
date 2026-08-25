@@ -45,6 +45,32 @@ type SchemaReport = {
   rollback_snapshot?: { id?: string };
 };
 
+type AppIntegrityMode = "off" | "audit" | "enforce";
+
+type AppIntegrityApp = {
+  platform: "ios" | "android";
+  team_id?: string;
+  bundle_id?: string;
+  app_apple_id?: number;
+  distribution?: "app_store_or_testflight";
+  package_name?: string;
+  cloud_project_number?: number;
+  signing_certificate_sha256?: string[];
+  allow_development?: boolean;
+};
+
+type AppIntegrityPolicy = {
+  mode: AppIntegrityMode;
+  apps: Record<string, AppIntegrityApp>;
+};
+
+type AppIntegrityCredentialStatus = {
+  configured: boolean;
+  client_email?: string;
+  google_project_id?: string;
+  updated_at?: number;
+};
+
 type ApiEnvelope<T> = { data: T };
 
 type StoredCredential = {
@@ -822,6 +848,254 @@ async function revokeProjectKey(
   return 0;
 }
 
+function positiveSafeInteger(args: string[], name: string): number {
+  const raw = requiredOption(args, name);
+  if (!/^\d+$/.test(raw)) throw new CliError(`${name} must be a positive integer`, 2);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new CliError(`${name} must be a positive safe integer`, 2);
+  }
+  return value;
+}
+
+function appIntegrityAppId(args: string[]): string {
+  const appId = requiredOption(args, "--app-id");
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(appId) || appId.length > 128) {
+    throw new CliError("--app-id must be at most 128 characters, start with a letter or underscore, and contain only letters, numbers, and underscores", 2);
+  }
+  return appId;
+}
+
+function normalizeCertificate(value: string): string {
+  const normalized = value.trim().replaceAll(":", "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new CliError("--certificate-sha256 must be a 64-digit SHA-256 hex digest", 2);
+  }
+  return normalized;
+}
+
+function appIntegrityEndpoint(platformUrl: string, project: string, suffix = ""): string {
+  return `${platformUrl}/platform/api/projects/${encodeURIComponent(project)}/app-integrity${suffix}`;
+}
+
+function swiftMobileSnippet(baseUrl: string, appId: string): string {
+  return `import Loomup\nimport LoomupAppIntegrity\n\nlet loomup = createMobileClient(\n    url: URL(string: ${JSON.stringify(baseUrl)})!,\n    appID: ${JSON.stringify(appId)}\n)`;
+}
+
+function androidMobileSnippet(
+  baseUrl: string,
+  appId: string,
+  cloudProjectNumber: number,
+): string {
+  return `import com.loomup.client.android.createAndroidClient\n\nval loomup = createAndroidClient(\n    context = applicationContext,\n    url = ${JSON.stringify(baseUrl)},\n    appId = ${JSON.stringify(appId)},\n    cloudProjectNumber = ${cloudProjectNumber}L,\n)`;
+}
+
+async function appIntegrityStatus(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--project"], ["--json"]);
+  const project = requiredOption(args, "--project");
+  const token = await sessionCredential(credentialPath);
+  const [policy, credential, detail] = await Promise.all([
+    requestJson<ApiEnvelope<AppIntegrityPolicy>>(appIntegrityEndpoint(platformUrl, project), token),
+    requestJson<ApiEnvelope<AppIntegrityCredentialStatus>>(
+      appIntegrityEndpoint(platformUrl, project, "/google-credential"),
+      token,
+    ),
+    requestJson<ApiEnvelope<{ base_url?: string }>>(
+      `${platformUrl}/platform/api/projects/${encodeURIComponent(project)}`,
+      token,
+    ),
+  ]);
+  const baseUrl = String(detail.data.base_url ?? "").replace(/\/$/, "");
+  if (flag(args, "--json")) {
+    io.stdout(JSON.stringify({ policy: policy.data, google_credential: credential.data, base_url: baseUrl }, null, 2));
+    return 0;
+  }
+  io.stdout(`Mode: ${policy.data.mode}`);
+  const entries = Object.entries(policy.data.apps ?? {});
+  if (!entries.length) io.stdout("Apps: none");
+  for (const [appId, app] of entries) {
+    if (app.platform === "ios") {
+      io.stdout(`\niOS ${appId}\n  bundle: ${app.bundle_id}\n  team: ${app.team_id}\n  Apple app ID: ${app.app_apple_id}`);
+      if (baseUrl) io.stdout(`\n${swiftMobileSnippet(baseUrl, appId)}`);
+    } else {
+      io.stdout(`\nAndroid ${appId}\n  package: ${app.package_name}\n  cloud project: ${app.cloud_project_number}`);
+      if (baseUrl && app.cloud_project_number) {
+        io.stdout(`\n${androidMobileSnippet(baseUrl, appId, app.cloud_project_number)}`);
+      }
+    }
+    if (app.allow_development) io.stdout("  warning: development proofs are allowed");
+  }
+  io.stdout(`\nGoogle Play credential: ${credential.data.configured ? "configured" : "not configured"}`);
+  if (credential.data.client_email) io.stdout(`  client: ${credential.data.client_email}`);
+  if (credential.data.google_project_id) io.stdout(`  project: ${credential.data.google_project_id}`);
+  return 0;
+}
+
+async function setIosAppIntegrity(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(
+    args,
+    ["--project", "--app-id", "--team-id", "--bundle-id", "--apple-app-id"],
+    ["--allow-development", "--json"],
+  );
+  const project = requiredOption(args, "--project");
+  const appId = appIntegrityAppId(args);
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<{ policy: AppIntegrityPolicy }>>(
+    appIntegrityEndpoint(platformUrl, project, `/apps/${encodeURIComponent(appId)}`),
+    token,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        platform: "ios",
+        team_id: requiredOption(args, "--team-id"),
+        bundle_id: requiredOption(args, "--bundle-id"),
+        app_apple_id: positiveSafeInteger(args, "--apple-app-id"),
+        distribution: "app_store_or_testflight",
+        allow_development: flag(args, "--allow-development"),
+      }),
+    },
+  );
+  if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Configured iOS app ${appId} for project ${project}.`);
+  return 0;
+}
+
+async function setAndroidAppIntegrity(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(
+    args,
+    ["--project", "--app-id", "--package-name", "--cloud-project-number", "--certificate-sha256"],
+    ["--allow-development", "--json"],
+  );
+  const project = requiredOption(args, "--project");
+  const appId = appIntegrityAppId(args);
+  const certificates = options(args, "--certificate-sha256").map(normalizeCertificate);
+  if (!certificates.length) throw new CliError("at least one --certificate-sha256 is required", 2);
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<{ policy: AppIntegrityPolicy }>>(
+    appIntegrityEndpoint(platformUrl, project, `/apps/${encodeURIComponent(appId)}`),
+    token,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        platform: "android",
+        package_name: requiredOption(args, "--package-name"),
+        cloud_project_number: positiveSafeInteger(args, "--cloud-project-number"),
+        signing_certificate_sha256: certificates,
+        allow_development: flag(args, "--allow-development"),
+      }),
+    },
+  );
+  if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Configured Android app ${appId} for project ${project}.`);
+  return 0;
+}
+
+async function removeAppIntegrityApp(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--project", "--app-id"], ["--json"]);
+  const project = requiredOption(args, "--project");
+  const appId = appIntegrityAppId(args);
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<{ policy: AppIntegrityPolicy }>>(
+    appIntegrityEndpoint(platformUrl, project, `/apps/${encodeURIComponent(appId)}`),
+    token,
+    { method: "DELETE" },
+  );
+  if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Removed app ${appId} from project ${project}.`);
+  return 0;
+}
+
+async function setAppIntegrityMode(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--project", "--mode"], ["--json"]);
+  const project = requiredOption(args, "--project");
+  const mode = requiredOption(args, "--mode") as AppIntegrityMode;
+  if (!["off", "audit", "enforce"].includes(mode)) {
+    throw new CliError("--mode must be off, audit, or enforce", 2);
+  }
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<{ policy: AppIntegrityPolicy }>>(
+    appIntegrityEndpoint(platformUrl, project, "/mode"),
+    token,
+    { method: "PUT", body: JSON.stringify({ mode }) },
+  );
+  if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Set app integrity mode to ${mode} for project ${project}.`);
+  return 0;
+}
+
+async function putGoogleIntegrityCredential(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--project", "--file"], ["--json"]);
+  const project = requiredOption(args, "--project");
+  const path = resolve(requiredOption(args, "--file"));
+  let credential: unknown;
+  try {
+    credential = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    throw new CliError(`cannot read Google credential JSON: ${String(error)}`, 2);
+  }
+  if (!credential || typeof credential !== "object" || Array.isArray(credential)) {
+    throw new CliError("Google credential must be a JSON object", 2);
+  }
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<AppIntegrityCredentialStatus>>(
+    appIntegrityEndpoint(platformUrl, project, "/google-credential"),
+    token,
+    { method: "PUT", body: JSON.stringify({ credential }) },
+  );
+  if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Google Play credential configured for ${response.data.client_email ?? project}.`);
+  return 0;
+}
+
+async function deleteGoogleIntegrityCredential(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--project"], ["--json"]);
+  const project = requiredOption(args, "--project");
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<{ ok: boolean }>>(
+    appIntegrityEndpoint(platformUrl, project, "/google-credential"),
+    token,
+    { method: "DELETE" },
+  );
+  if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Deleted Google Play credential for project ${project}.`);
+  return 0;
+}
+
 function usage(io: CliIO): void {
   io.stdout(`Usage:
   loomup auth login
@@ -832,6 +1106,13 @@ function usage(io: CliIO): void {
   loomup project-keys create --project <id> --name <name> --scope <scope>... [--json]
   loomup project-keys list --project <id> [--json]
   loomup project-keys revoke --project <id> --id <key-id>
+  loomup app-integrity status --project <id> [--json]
+  loomup app-integrity set-ios --project <id> --app-id <id> --team-id <id> --bundle-id <id> --apple-app-id <number> [--allow-development] [--json]
+  loomup app-integrity set-android --project <id> --app-id <id> --package-name <name> --cloud-project-number <number> --certificate-sha256 <digest>... [--allow-development] [--json]
+  loomup app-integrity remove-app --project <id> --app-id <id> [--json]
+  loomup app-integrity set-mode --project <id> --mode <off|audit|enforce> [--json]
+  loomup app-integrity put-google-credential --project <id> --file <json> [--json]
+  loomup app-integrity delete-google-credential --project <id> [--json]
   loomup init [--schema <path>] [--access <path>] [--output <path>]
   loomup generate [--schema <path>] [--output <path>] [--check]
   loomup migrate [--plan] [--allow-data-loss] [--json] [--schema <path>] [--access <path>]
@@ -877,6 +1158,20 @@ export async function runCli(
       return await listProjectKeys(args.slice(2), io, platformUrl, credentialPath);
     if (args[0] === "project-keys" && args[1] === "revoke")
       return await revokeProjectKey(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "app-integrity" && args[1] === "status")
+      return await appIntegrityStatus(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "app-integrity" && args[1] === "set-ios")
+      return await setIosAppIntegrity(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "app-integrity" && args[1] === "set-android")
+      return await setAndroidAppIntegrity(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "app-integrity" && args[1] === "remove-app")
+      return await removeAppIntegrityApp(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "app-integrity" && args[1] === "set-mode")
+      return await setAppIntegrityMode(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "app-integrity" && args[1] === "put-google-credential")
+      return await putGoogleIntegrityCredential(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "app-integrity" && args[1] === "delete-google-credential")
+      return await deleteGoogleIntegrityCredential(args.slice(2), io, platformUrl, credentialPath);
     throw new CliError(`unknown command: ${args.join(" ")}`, 2);
   } catch (error) {
     const cliError = error instanceof CliError ? error : new CliError(String(error));

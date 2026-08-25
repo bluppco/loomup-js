@@ -408,6 +408,132 @@ test("workspace automation commands create projects and constrained project keys
   assert.ok(logs.stdout.includes("loomup_sk_once"));
 });
 
+test("app-integrity commands use the manager session and send normalized identities", async () => {
+  const requests: Array<{ method?: string; path?: string; authorization?: string; body?: any }> = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      requests.push({
+        method: request.method,
+        path: request.url,
+        authorization: request.headers.authorization,
+        body: body ? JSON.parse(body) : undefined,
+      });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      if (request.url?.endsWith("google-credential")) {
+        response.end(JSON.stringify({ data: { configured: true, client_email: "play@example.com" } }));
+      } else {
+        response.end(JSON.stringify({ data: { policy: { mode: "audit", apps: {} } } }));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-integrity-"));
+  const credentialPath = join(directory, "play.json");
+  const privateKey = "-----BEGIN PRIVATE KEY-----\ntest-only\n-----END PRIVATE KEY-----";
+  await writeFile(credentialPath, JSON.stringify({
+    type: "service_account",
+    client_email: "play@example.com",
+    private_key: privateKey,
+  }));
+  process.env.LOOMUP_PLATFORM_TOKEN = "manager-session";
+  process.env.LOOMUP_WORKSPACE_API_KEY = "lbsk_must_not_be_used";
+  const logs = output();
+  try {
+    assert.equal(await runCli([
+      "app-integrity", "set-ios", "--project", "project-1", "--app-id", "ios_main",
+      "--team-id", "TEAM123", "--bundle-id", "com.example.ios", "--apple-app-id", "1234567890",
+    ], { io: logs.io, platformUrl }), 0);
+    assert.equal(await runCli([
+      "app-integrity", "set-android", "--project", "project-1", "--app-id", "android_main",
+      "--package-name", "com.example.android", "--cloud-project-number", "123456789012",
+      "--certificate-sha256", "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF",
+      "--allow-development",
+    ], { io: logs.io, platformUrl }), 0);
+    assert.equal(await runCli([
+      "app-integrity", "set-mode", "--project", "project-1", "--mode", "audit",
+    ], { io: logs.io, platformUrl }), 0);
+    assert.equal(await runCli([
+      "app-integrity", "put-google-credential", "--project", "project-1", "--file", credentialPath,
+    ], { io: logs.io, platformUrl }), 0);
+  } finally {
+    server.close();
+  }
+  assert.equal(requests.length, 4);
+  assert.ok(requests.every((request) => request.authorization === "Bearer manager-session"));
+  assert.equal(requests[0]?.path, "/platform/api/projects/project-1/app-integrity/apps/ios_main");
+  assert.deepEqual(requests[0]?.body, {
+    platform: "ios",
+    team_id: "TEAM123",
+    bundle_id: "com.example.ios",
+    app_apple_id: 1234567890,
+    distribution: "app_store_or_testflight",
+    allow_development: false,
+  });
+  assert.deepEqual(requests[1]?.body.signing_certificate_sha256, [
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  ]);
+  assert.equal(requests[1]?.body.allow_development, true);
+  assert.deepEqual(requests[2]?.body, { mode: "audit" });
+  assert.equal(requests[3]?.body.credential.private_key, privateKey);
+  assert.ok(!logs.stdout.join("\n").includes(privateKey));
+});
+
+test("app-integrity status prints native setup without exposing credential secrets", async () => {
+  const server = createServer((request, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    if (request.url?.endsWith("/app-integrity")) {
+      response.end(JSON.stringify({ data: { mode: "audit", apps: {
+        ios_main: { platform: "ios", bundle_id: "com.example.ios", team_id: "TEAM", app_apple_id: 123 },
+        android_main: { platform: "android", package_name: "com.example.android", cloud_project_number: 456 },
+      } } }));
+    } else if (request.url?.endsWith("google-credential")) {
+      response.end(JSON.stringify({ data: { configured: true, client_email: "play@example.com" } }));
+    } else {
+      response.end(JSON.stringify({ data: { base_url: "https://tryloomup.com/p/project-1" } }));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  process.env.LOOMUP_PLATFORM_TOKEN = "manager-session";
+  const logs = output();
+  try {
+    assert.equal(await runCli(
+      ["app-integrity", "status", "--project", "project-1"],
+      { io: logs.io, platformUrl: `http://127.0.0.1:${address.port}` },
+    ), 0);
+  } finally {
+    server.close();
+  }
+  const printed = logs.stdout.join("\n");
+  assert.match(printed, /Mode: audit/);
+  assert.match(printed, /createMobileClient/);
+  assert.match(printed, /createAndroidClient/);
+  assert.match(printed, /import com\.loomup\.client\.android\.createAndroidClient/);
+  assert.match(printed, /play@example.com/);
+});
+
+test("app-integrity rejects invalid numeric and certificate flags before transport", async () => {
+  process.env.LOOMUP_PLATFORM_TOKEN = "manager-session";
+  const badNumber = output();
+  assert.equal(await runCli([
+    "app-integrity", "set-ios", "--project", "project-1", "--app-id", "ios_main",
+    "--team-id", "TEAM", "--bundle-id", "com.example", "--apple-app-id", "not-a-number",
+  ], { io: badNumber.io }), 2);
+  assert.match(badNumber.stderr.join("\n"), /positive integer/);
+  const badCertificate = output();
+  assert.equal(await runCli([
+    "app-integrity", "set-android", "--project", "project-1", "--app-id", "android_main",
+    "--package-name", "com.example", "--cloud-project-number", "123", "--certificate-sha256", "bad",
+  ], { io: badCertificate.io }), 2);
+  assert.match(badCertificate.stderr.join("\n"), /64-digit/);
+});
+
 test("generate emits a ready typed project client from the standalone schema", async () => {
   const directory = await mkdtemp(join(tmpdir(), "loomup-cli-generate-"));
   await writeFile(
