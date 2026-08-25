@@ -73,6 +73,33 @@ type AppIntegrityCredentialStatus = {
 
 type ApiEnvelope<T> = { data: T };
 
+type Workspace = {
+  id: string;
+  name: string;
+  slug: string;
+  owner_user_id: string;
+  created_at: number;
+};
+
+type HostedProject = {
+  id: string;
+  workspace_id: string;
+  name: string;
+  slug: string;
+};
+
+type HostedProjectDetail = {
+  project: HostedProject;
+  base_url?: string;
+  studio_url?: string;
+};
+
+type ProjectApiKey = {
+  id: string;
+  name: string;
+  scopes?: string[];
+};
+
 type StoredCredential = {
   platform: typeof PLATFORM_URL;
   token: string;
@@ -98,6 +125,12 @@ type RunOptions = {
   platformUrl?: string;
   /** Test-only credential isolation. */
   credentialPath?: string;
+  /** Test-only interactive-mode override. */
+  interactive?: boolean;
+  /** Test-only login prompt injection. */
+  loginCredentials?: () => Promise<{ email: string; password: string }>;
+  /** Test-only workspace selector injection. */
+  workspaceChoice?: (workspaces: Workspace[]) => Promise<string>;
 };
 
 const starterSchemaPath = fileURLToPath(
@@ -329,6 +362,32 @@ function cleanUrl(value: string): string {
   return parseLoomupUrl(value).url;
 }
 
+async function resolveHostedProjectId(
+  args: string[],
+  cwd: string,
+  platformUrl: string,
+): Promise<string> {
+  const explicit = option(args, "--project")?.trim();
+  if (explicit) return explicit;
+  const environment = process.env.LOOMUP_PROJECT_ID?.trim();
+  if (environment) return environment;
+  const packagePath = await findPackageJson(cwd);
+  if (packagePath) {
+    const config = (await readPackage(packagePath)).loomup;
+    if (config?.project && config.url) {
+      if (cleanUrl(config.url) === cleanUrl(platformUrl)) return config.project;
+      throw new CliError(
+        `linked project uses ${cleanUrl(config.url)}; pass --project for hosted commands on ${cleanUrl(platformUrl)}`,
+        2,
+      );
+    }
+  }
+  throw new CliError(
+    `--project is required unless LOOMUP_PROJECT_ID is set or the package is linked to ${cleanUrl(platformUrl)}`,
+    2,
+  );
+}
+
 type ResolvedProject = {
   url: string;
   project: string;
@@ -417,6 +476,84 @@ async function requestJson<T>(
     throw new CliError(`Loomup ${response.status}: ${String(message)}`, code);
   }
   return body as T;
+}
+
+async function fetchWorkspaces(platformUrl: string, token: string): Promise<Workspace[]> {
+  const response = await requestJson<ApiEnvelope<Workspace[]>>(
+    `${platformUrl}/platform/api/workspaces`,
+    token,
+  );
+  return response.data;
+}
+
+function printWorkspaces(workspaces: Workspace[], io: CliIO): void {
+  if (!workspaces.length) {
+    io.stdout("No workspaces found. Create one with `loomup workspaces create --name <name>`.");
+    return;
+  }
+  for (const workspace of workspaces) {
+    io.stdout(`${workspace.id}\t${workspace.name}\t${workspace.slug}`);
+  }
+}
+
+function workspaceChoices(workspaces: Workspace[]): string {
+  return workspaces.map((workspace) => `  ${workspace.id}\t${workspace.name}`).join("\n");
+}
+
+async function promptForWorkspace(workspaces: Workspace[]): Promise<string> {
+  process.stderr.write("Choose a workspace:\n");
+  workspaces.forEach((workspace, index) => {
+    process.stderr.write(`  ${index + 1}) ${workspace.name} (${workspace.id})\n`);
+  });
+  const readline = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    while (true) {
+      const answer = (await readline.question("Workspace: ")).trim();
+      const number = Number(answer);
+      if (Number.isInteger(number) && number >= 1 && number <= workspaces.length) {
+        return workspaces[number - 1]!.id;
+      }
+      const exact = workspaces.find((workspace) => workspace.id === answer);
+      if (exact) return exact.id;
+      process.stderr.write(`Enter a number from 1 to ${workspaces.length} or an exact workspace ID.\n`);
+    }
+  } finally {
+    readline.close();
+  }
+}
+
+async function resolveWorkspaceForCreate(
+  args: string[],
+  platformUrl: string,
+  credentialPath: string,
+  interactive: boolean,
+  workspaceChoice?: (workspaces: Workspace[]) => Promise<string>,
+): Promise<{ workspace: string; token: string }> {
+  const explicit = option(args, "--workspace")?.trim();
+  if (explicit) return { workspace: explicit, token: await platformCredential(credentialPath) };
+  if (process.env.LOOMUP_WORKSPACE_API_KEY?.trim()) {
+    throw new CliError("--workspace is required when using LOOMUP_WORKSPACE_API_KEY", 2);
+  }
+  const token = await sessionCredential(credentialPath);
+  const workspaces = await fetchWorkspaces(platformUrl, token);
+  if (!workspaces.length) {
+    throw new CliError(
+      "no workspace available; create one with `loomup workspaces create --name <name>`",
+      2,
+    );
+  }
+  if (workspaces.length === 1) return { workspace: workspaces[0]!.id, token };
+  if (flag(args, "--json") || (!interactive && !workspaceChoice)) {
+    throw new CliError(
+      `multiple workspaces available; rerun with --workspace <id>:\n${workspaceChoices(workspaces)}`,
+      2,
+    );
+  }
+  const selected = await (workspaceChoice ?? promptForWorkspace)(workspaces);
+  if (!workspaces.some((workspace) => workspace.id === selected)) {
+    throw new CliError(`unknown workspace selection ${JSON.stringify(selected)}`, 2);
+  }
+  return { workspace: selected, token };
 }
 
 function printPlan(report: SchemaReport, io: CliIO): void {
@@ -514,24 +651,21 @@ async function migrate(
   return 0;
 }
 
-async function linkProject(
-  args: string[],
-  cwd: string,
-  io: CliIO,
-  credentialPath: string,
-): Promise<number> {
-  validateOptions(args, ["--url", "--project", "--schema", "--access", "--output"], []);
-  const urlValue = option(args, "--url") ?? process.env.LOOMUP_URL;
-  const parsedUrl = urlValue ? parseLoomupUrl(urlValue) : undefined;
-  const project =
-    option(args, "--project") ?? process.env.LOOMUP_PROJECT_ID ?? parsedUrl?.project;
-  if (!parsedUrl || !project) {
-    throw new CliError(
-      "link requires --url and --project (or a /p/<project-id> URL)",
-      2,
-    );
-  }
-  const url = parsedUrl.url;
+type LinkTarget = {
+  packagePath: string;
+  schema: string;
+  schemaPath: string;
+  access: string;
+  accessPath: string;
+  output: string;
+};
+
+type LocalLinkResult = {
+  package_path: string;
+  output_path: string;
+};
+
+async function prepareLinkTarget(args: string[], cwd: string): Promise<LinkTarget> {
   const packagePath = await findPackageJson(cwd);
   if (!packagePath) {
     throw new CliError("link must run inside a project with package.json", 2);
@@ -543,28 +677,19 @@ async function linkProject(
   const access = option(args, "--access") ?? document.loomup?.access ?? "loomup.access.ts";
   const accessPath = resolve(dirname(packagePath), access);
   const output = option(args, "--output") ?? document.loomup?.output ?? DEFAULT_CLIENT_PATH;
+  return { packagePath, schema, schemaPath, access, accessPath, output };
+}
+
+async function persistProjectLink(
+  target: LinkTarget,
+  url: string,
+  project: string,
+  io: CliIO,
+): Promise<LocalLinkResult> {
+  const { packagePath, schema, schemaPath, access, accessPath, output } = target;
   await ensureStarterSchema(schemaPath, io);
   await ensureStarterAccess(accessPath, io);
-  const credential = await loomupCredential(credentialPath);
-  if (credential.projectKey) {
-    const schemaSource = await readFile(schemaPath, "utf8");
-    const compiledAccess = await loadAndCompileAccess(schemaSource, accessPath).catch((error) => {
-      throw new CliError(String(error), 2);
-    });
-    await requestJson(
-      `${url}/platform/api/projects/${encodeURIComponent(project)}/schema/${compiledAccess ? "migrate-with-access" : "migrate"}`,
-      credential.token,
-      {
-        method: "POST",
-        body: JSON.stringify({ schema: schemaSource, compiled_access: compiledAccess, dry_run: true, allow_data_loss: false }),
-      },
-    );
-  } else {
-    await requestJson(
-      `${url}/platform/api/projects/${encodeURIComponent(project)}`,
-      credential.token,
-    );
-  }
+  const document = await readPackage(packagePath);
   document.loomup = {
     ...(document.loomup ?? {}),
     url,
@@ -583,6 +708,51 @@ async function linkProject(
   });
   io.stdout(`Linked ${basename(dirname(packagePath))} to Loomup project ${project}.`);
   io.stdout(`Generated Loomup client at ${generated.outputPath}.`);
+  return { package_path: packagePath, output_path: generated.outputPath };
+}
+
+async function linkProject(
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--url", "--project", "--schema", "--access", "--output"], []);
+  const urlValue = option(args, "--url") ?? process.env.LOOMUP_URL;
+  const parsedUrl = urlValue ? parseLoomupUrl(urlValue) : undefined;
+  const project =
+    option(args, "--project") ?? process.env.LOOMUP_PROJECT_ID ?? parsedUrl?.project;
+  if (!parsedUrl || !project) {
+    throw new CliError(
+      "link requires --url and --project (or a /p/<project-id> URL)",
+      2,
+    );
+  }
+  const url = parsedUrl.url;
+  const target = await prepareLinkTarget(args, cwd);
+  await ensureStarterSchema(target.schemaPath, io);
+  await ensureStarterAccess(target.accessPath, io);
+  const credential = await loomupCredential(credentialPath);
+  if (credential.projectKey) {
+    const schemaSource = await readFile(target.schemaPath, "utf8");
+    const compiledAccess = await loadAndCompileAccess(schemaSource, target.accessPath).catch((error) => {
+      throw new CliError(String(error), 2);
+    });
+    await requestJson(
+      `${url}/platform/api/projects/${encodeURIComponent(project)}/schema/${compiledAccess ? "migrate-with-access" : "migrate"}`,
+      credential.token,
+      {
+        method: "POST",
+        body: JSON.stringify({ schema: schemaSource, compiled_access: compiledAccess, dry_run: true, allow_data_loss: false }),
+      },
+    );
+  } else {
+    await requestJson(
+      `${url}/platform/api/projects/${encodeURIComponent(project)}`,
+      credential.token,
+    );
+  }
+  await persistProjectLink(target, url, project, io);
   return 0;
 }
 
@@ -643,17 +813,23 @@ async function promptHidden(label: string): Promise<string> {
   return value;
 }
 
+async function promptLoginCredentials(): Promise<{ email: string; password: string }> {
+  const readline = createInterface({ input: process.stdin, output: process.stderr });
+  const email = await readline.question("Platform email: ");
+  readline.close();
+  const password = await promptHidden("Platform password: ");
+  return { email, password };
+}
+
 async function login(
   args: string[],
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
+  loginCredentials: () => Promise<{ email: string; password: string }> = promptLoginCredentials,
 ): Promise<number> {
   validateOptions(args, [], []);
-  const readline = createInterface({ input: process.stdin, output: process.stderr });
-  const email = await readline.question("Platform email: ");
-  readline.close();
-  const password = await promptHidden("Platform password: ");
+  const { email, password } = await loginCredentials();
   let response: Response;
   try {
     response = await fetch(`${platformUrl}/platform/api/auth/login`, {
@@ -670,8 +846,15 @@ async function login(
   const setCookie = response.headers.get("set-cookie") ?? "";
   const token = /(?:^|[,;]\s*)loomup_platform_session=([^;,]+)/.exec(setCookie)?.[1];
   if (!token) throw new CliError("login response did not contain a platform session");
-  await writeStoredCredential(credentialPath, decodeURIComponent(token));
+  const decodedToken = decodeURIComponent(token);
+  await writeStoredCredential(credentialPath, decodedToken);
   io.stdout(`Authenticated with ${PLATFORM_URL}.`);
+  try {
+    const workspaces = await fetchWorkspaces(platformUrl, decodedToken);
+    printWorkspaces(workspaces, io);
+  } catch (error) {
+    io.stderr(`Authenticated, but workspace discovery failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return 0;
 }
 
@@ -710,6 +893,39 @@ async function logout(
   return 0;
 }
 
+async function listHostedWorkspaces(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, [], ["--json"]);
+  const token = await sessionCredential(credentialPath);
+  const workspaces = await fetchWorkspaces(platformUrl, token);
+  if (flag(args, "--json")) io.stdout(JSON.stringify(workspaces, null, 2));
+  else printWorkspaces(workspaces, io);
+  return 0;
+}
+
+async function createHostedWorkspace(
+  args: string[],
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  validateOptions(args, ["--name"], ["--json"]);
+  const name = requiredOption(args, "--name");
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<Workspace>>(
+    `${platformUrl}/platform/api/workspaces`,
+    token,
+    { method: "POST", body: JSON.stringify({ name }) },
+  );
+  if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Created workspace ${response.data.name} (${response.data.id}).`);
+  return 0;
+}
+
 function requiredOption(args: string[], name: string): string {
   const value = option(args, name)?.trim();
   if (!value) throw new CliError(`${name} is required`, 2);
@@ -729,15 +945,24 @@ function optionalExpiry(args: string[]): number | undefined {
 
 async function createHostedProject(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
+  interactive: boolean,
+  workspaceChoice?: (workspaces: Workspace[]) => Promise<string>,
 ): Promise<number> {
-  validateOptions(args, ["--workspace", "--name", "--template"], ["--json"]);
-  const workspace = requiredOption(args, "--workspace");
+  validateOptions(args, ["--workspace", "--name", "--template"], ["--json", "--link"]);
   const name = requiredOption(args, "--name");
-  const token = await platformCredential(credentialPath);
-  const response = await requestJson<ApiEnvelope<any>>(
+  const linkTarget = flag(args, "--link") ? await prepareLinkTarget(args, cwd) : undefined;
+  const { workspace, token } = await resolveWorkspaceForCreate(
+    args,
+    platformUrl,
+    credentialPath,
+    interactive,
+    workspaceChoice,
+  );
+  const response = await requestJson<ApiEnvelope<HostedProjectDetail>>(
     `${platformUrl}/platform/api/projects`,
     token,
     {
@@ -749,10 +974,29 @@ async function createHostedProject(
       }),
     },
   );
-  if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
-  else {
+  const project = response.data.project;
+  const baseUrl = response.data.base_url?.replace(/\/$/, "") || `${platformUrl}/p/${encodeURIComponent(project.id)}`;
+  const recoveryCommand = `loomup link --url ${baseUrl}`;
+  const jsonOutput = flag(args, "--json");
+  if (!jsonOutput) {
     io.stdout(`Created project ${response.data.project.name} (${response.data.project.id}).`);
-    if (response.data.base_url) io.stdout(`Project URL: ${response.data.base_url}`);
+    io.stdout(`Project URL: ${baseUrl}`);
+  }
+  let localLink: LocalLinkResult | undefined;
+  if (linkTarget) {
+    const linkIo = jsonOutput ? { stdout: () => undefined, stderr: () => undefined } : io;
+    try {
+      localLink = await persistProjectLink(linkTarget, cleanUrl(baseUrl), project.id, linkIo);
+    } catch (error) {
+      throw new CliError(
+        `project ${project.name} (${project.id}) was created, but local linking failed: ${error instanceof Error ? error.message : String(error)}\nRecover with: ${recoveryCommand}`,
+      );
+    }
+  }
+  if (jsonOutput) {
+    io.stdout(JSON.stringify(localLink ? { ...response.data, local_link: localLink } : response.data, null, 2));
+  } else if (!linkTarget) {
+    io.stdout(`Next: ${recoveryCommand}`);
   }
   return 0;
 }
@@ -764,19 +1008,33 @@ async function listHostedProjects(
   credentialPath: string,
 ): Promise<number> {
   validateOptions(args, ["--workspace"], ["--json"]);
-  const workspace = requiredOption(args, "--workspace");
-  const token = await platformCredential(credentialPath);
-  const response = await requestJson<ApiEnvelope<any[]>>(
-    `${platformUrl}/platform/api/projects?workspace_id=${encodeURIComponent(workspace)}`,
+  const workspace = option(args, "--workspace")?.trim();
+  if (!workspace && process.env.LOOMUP_WORKSPACE_API_KEY?.trim()) {
+    throw new CliError("--workspace is required when using LOOMUP_WORKSPACE_API_KEY", 2);
+  }
+  const token = workspace
+    ? await platformCredential(credentialPath)
+    : await sessionCredential(credentialPath);
+  const endpoint = workspace
+    ? `${platformUrl}/platform/api/projects?workspace_id=${encodeURIComponent(workspace)}`
+    : `${platformUrl}/platform/api/projects`;
+  const response = await requestJson<ApiEnvelope<HostedProject[]>>(
+    endpoint,
     token,
   );
   if (flag(args, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
-  else for (const project of response.data) io.stdout(`${project.id}\t${project.name}`);
+  else if (!response.data.length) io.stdout("No projects found.");
+  else for (const project of response.data) {
+    io.stdout(workspace
+      ? `${project.id}\t${project.name}`
+      : `${project.id}\t${project.workspace_id}\t${project.name}`);
+  }
   return 0;
 }
 
 async function createProjectKey(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
@@ -786,12 +1044,12 @@ async function createProjectKey(
     ["--project", "--name", "--scope", "--expires-at"],
     ["--json"],
   );
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const name = requiredOption(args, "--name");
   const scopes = options(args, "--scope").map((scope) => scope.trim()).filter(Boolean);
   if (!scopes.length) throw new CliError("at least one --scope is required", 2);
   const token = await platformCredential(credentialPath);
-  const response = await requestJson<ApiEnvelope<any>>(
+  const response = await requestJson<ApiEnvelope<ProjectApiKey & { key: string }>>(
     `${platformUrl}/platform/api/projects/${encodeURIComponent(project)}/studio/api-keys`,
     token,
     {
@@ -809,14 +1067,15 @@ async function createProjectKey(
 
 async function listProjectKeys(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
 ): Promise<number> {
   validateOptions(args, ["--project"], ["--json"]);
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const token = await platformCredential(credentialPath);
-  const response = await requestJson<ApiEnvelope<any[]>>(
+  const response = await requestJson<ApiEnvelope<ProjectApiKey[]>>(
     `${platformUrl}/platform/api/projects/${encodeURIComponent(project)}/studio/api-keys`,
     token,
   );
@@ -831,12 +1090,13 @@ async function listProjectKeys(
 
 async function revokeProjectKey(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
 ): Promise<number> {
   validateOptions(args, ["--project", "--id"], []);
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const id = requiredOption(args, "--id");
   const token = await platformCredential(credentialPath);
   await requestJson(
@@ -892,12 +1152,13 @@ function androidMobileSnippet(
 
 async function appIntegrityStatus(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
 ): Promise<number> {
   validateOptions(args, ["--project"], ["--json"]);
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const token = await sessionCredential(credentialPath);
   const [policy, credential, detail] = await Promise.all([
     requestJson<ApiEnvelope<AppIntegrityPolicy>>(appIntegrityEndpoint(platformUrl, project), token),
@@ -938,6 +1199,7 @@ async function appIntegrityStatus(
 
 async function setIosAppIntegrity(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
@@ -947,7 +1209,7 @@ async function setIosAppIntegrity(
     ["--project", "--app-id", "--team-id", "--bundle-id", "--apple-app-id"],
     ["--allow-development", "--json"],
   );
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const appId = appIntegrityAppId(args);
   const token = await sessionCredential(credentialPath);
   const response = await requestJson<ApiEnvelope<{ policy: AppIntegrityPolicy }>>(
@@ -972,6 +1234,7 @@ async function setIosAppIntegrity(
 
 async function setAndroidAppIntegrity(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
@@ -981,7 +1244,7 @@ async function setAndroidAppIntegrity(
     ["--project", "--app-id", "--package-name", "--cloud-project-number", "--certificate-sha256"],
     ["--allow-development", "--json"],
   );
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const appId = appIntegrityAppId(args);
   const certificates = options(args, "--certificate-sha256").map(normalizeCertificate);
   if (!certificates.length) throw new CliError("at least one --certificate-sha256 is required", 2);
@@ -1007,12 +1270,13 @@ async function setAndroidAppIntegrity(
 
 async function removeAppIntegrityApp(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
 ): Promise<number> {
   validateOptions(args, ["--project", "--app-id"], ["--json"]);
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const appId = appIntegrityAppId(args);
   const token = await sessionCredential(credentialPath);
   const response = await requestJson<ApiEnvelope<{ policy: AppIntegrityPolicy }>>(
@@ -1027,12 +1291,13 @@ async function removeAppIntegrityApp(
 
 async function setAppIntegrityMode(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
 ): Promise<number> {
   validateOptions(args, ["--project", "--mode"], ["--json"]);
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const mode = requiredOption(args, "--mode") as AppIntegrityMode;
   if (!["off", "audit", "enforce"].includes(mode)) {
     throw new CliError("--mode must be off, audit, or enforce", 2);
@@ -1050,12 +1315,13 @@ async function setAppIntegrityMode(
 
 async function putGoogleIntegrityCredential(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
 ): Promise<number> {
   validateOptions(args, ["--project", "--file"], ["--json"]);
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const path = resolve(requiredOption(args, "--file"));
   let credential: unknown;
   try {
@@ -1079,12 +1345,13 @@ async function putGoogleIntegrityCredential(
 
 async function deleteGoogleIntegrityCredential(
   args: string[],
+  cwd: string,
   io: CliIO,
   platformUrl: string,
   credentialPath: string,
 ): Promise<number> {
   validateOptions(args, ["--project"], ["--json"]);
-  const project = requiredOption(args, "--project");
+  const project = await resolveHostedProjectId(args, cwd, platformUrl);
   const token = await sessionCredential(credentialPath);
   const response = await requestJson<ApiEnvelope<{ ok: boolean }>>(
     appIntegrityEndpoint(platformUrl, project, "/google-credential"),
@@ -1101,18 +1368,20 @@ function usage(io: CliIO): void {
   loomup auth login
   loomup auth status
   loomup auth logout
-  loomup projects create --workspace <id> --name <name> [--template <name>] [--json]
-  loomup projects list --workspace <id> [--json]
-  loomup project-keys create --project <id> --name <name> --scope <scope>... [--json]
-  loomup project-keys list --project <id> [--json]
-  loomup project-keys revoke --project <id> --id <key-id>
-  loomup app-integrity status --project <id> [--json]
-  loomup app-integrity set-ios --project <id> --app-id <id> --team-id <id> --bundle-id <id> --apple-app-id <number> [--allow-development] [--json]
-  loomup app-integrity set-android --project <id> --app-id <id> --package-name <name> --cloud-project-number <number> --certificate-sha256 <digest>... [--allow-development] [--json]
-  loomup app-integrity remove-app --project <id> --app-id <id> [--json]
-  loomup app-integrity set-mode --project <id> --mode <off|audit|enforce> [--json]
-  loomup app-integrity put-google-credential --project <id> --file <json> [--json]
-  loomup app-integrity delete-google-credential --project <id> [--json]
+  loomup workspaces list [--json]
+  loomup workspaces create --name <name> [--json]
+  loomup projects create --name <name> [--workspace <id>] [--template <name>] [--link] [--json]
+  loomup projects list [--workspace <id>] [--json]
+  loomup project-keys create [--project <id>] --name <name> --scope <scope>... [--json]
+  loomup project-keys list [--project <id>] [--json]
+  loomup project-keys revoke [--project <id>] --id <key-id>
+  loomup app-integrity status [--project <id>] [--json]
+  loomup app-integrity set-ios [--project <id>] --app-id <id> --team-id <id> --bundle-id <id> --apple-app-id <number> [--allow-development] [--json]
+  loomup app-integrity set-android [--project <id>] --app-id <id> --package-name <name> --cloud-project-number <number> --certificate-sha256 <digest>... [--allow-development] [--json]
+  loomup app-integrity remove-app [--project <id>] --app-id <id> [--json]
+  loomup app-integrity set-mode [--project <id>] --mode <off|audit|enforce> [--json]
+  loomup app-integrity put-google-credential [--project <id>] --file <json> [--json]
+  loomup app-integrity delete-google-credential [--project <id>] [--json]
   loomup init [--schema <path>] [--access <path>] [--output <path>]
   loomup generate [--schema <path>] [--output <path>] [--check]
   loomup migrate [--plan] [--allow-data-loss] [--json] [--schema <path>] [--access <path>]
@@ -1129,6 +1398,7 @@ export async function runCli(
   const cwd = options.cwd ?? process.cwd();
   const platformUrl = options.platformUrl ?? PLATFORM_URL;
   const credentialPath = options.credentialPath ?? DEFAULT_CREDENTIAL_PATH;
+  const interactive = options.interactive ?? Boolean(process.stdin.isTTY && process.stderr.isTTY);
   try {
     if (!args.length || flag(args, "--help") || flag(args, "-h")) {
       usage(io);
@@ -1143,35 +1413,41 @@ export async function runCli(
     if (args[0] === "link")
       return await linkProject(args.slice(1), cwd, io, credentialPath);
     if (args[0] === "auth" && args[1] === "login")
-      return await login(args.slice(2), io, platformUrl, credentialPath);
+      return await login(args.slice(2), io, platformUrl, credentialPath, options.loginCredentials);
     if (args[0] === "auth" && args[1] === "status")
       return await authStatus(args.slice(2), io, platformUrl, credentialPath);
     if (args[0] === "auth" && args[1] === "logout")
       return await logout(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "workspaces" && args[1] === "list")
+      return await listHostedWorkspaces(args.slice(2), io, platformUrl, credentialPath);
+    if (args[0] === "workspaces" && args[1] === "create")
+      return await createHostedWorkspace(args.slice(2), io, platformUrl, credentialPath);
     if (args[0] === "projects" && args[1] === "create")
-      return await createHostedProject(args.slice(2), io, platformUrl, credentialPath);
+      return await createHostedProject(
+        args.slice(2), cwd, io, platformUrl, credentialPath, interactive, options.workspaceChoice,
+      );
     if (args[0] === "projects" && args[1] === "list")
       return await listHostedProjects(args.slice(2), io, platformUrl, credentialPath);
     if (args[0] === "project-keys" && args[1] === "create")
-      return await createProjectKey(args.slice(2), io, platformUrl, credentialPath);
+      return await createProjectKey(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "project-keys" && args[1] === "list")
-      return await listProjectKeys(args.slice(2), io, platformUrl, credentialPath);
+      return await listProjectKeys(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "project-keys" && args[1] === "revoke")
-      return await revokeProjectKey(args.slice(2), io, platformUrl, credentialPath);
+      return await revokeProjectKey(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "app-integrity" && args[1] === "status")
-      return await appIntegrityStatus(args.slice(2), io, platformUrl, credentialPath);
+      return await appIntegrityStatus(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "app-integrity" && args[1] === "set-ios")
-      return await setIosAppIntegrity(args.slice(2), io, platformUrl, credentialPath);
+      return await setIosAppIntegrity(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "app-integrity" && args[1] === "set-android")
-      return await setAndroidAppIntegrity(args.slice(2), io, platformUrl, credentialPath);
+      return await setAndroidAppIntegrity(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "app-integrity" && args[1] === "remove-app")
-      return await removeAppIntegrityApp(args.slice(2), io, platformUrl, credentialPath);
+      return await removeAppIntegrityApp(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "app-integrity" && args[1] === "set-mode")
-      return await setAppIntegrityMode(args.slice(2), io, platformUrl, credentialPath);
+      return await setAppIntegrityMode(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "app-integrity" && args[1] === "put-google-credential")
-      return await putGoogleIntegrityCredential(args.slice(2), io, platformUrl, credentialPath);
+      return await putGoogleIntegrityCredential(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "app-integrity" && args[1] === "delete-google-credential")
-      return await deleteGoogleIntegrityCredential(args.slice(2), io, platformUrl, credentialPath);
+      return await deleteGoogleIntegrityCredential(args.slice(2), cwd, io, platformUrl, credentialPath);
     throw new CliError(`unknown command: ${args.join(" ")}`, 2);
   } catch (error) {
     const cliError = error instanceof CliError ? error : new CliError(String(error));

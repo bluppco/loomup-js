@@ -20,6 +20,21 @@ npx loomup auth status
 npx loomup auth logout
 ```
 
+Login prints the workspaces available to the account. You can inspect or create
+them again at any time, then provision a project and link the current package:
+
+```bash
+npx loomup workspaces list
+npx loomup workspaces create --name "Acme"     # only when another workspace is needed
+npx loomup projects create --name my-app --link
+```
+
+When the account has one workspace, project creation selects it automatically.
+With several workspaces, an interactive terminal prompts for one; scripts must
+pass `--workspace <workspace-id>`. Without `--link`, the CLI prints the exact
+`loomup link` command to run next. `npx loomup projects list` lists projects from
+all accessible workspaces; `--workspace` filters the result.
+
 Logged-in project managers can configure native App Attest and Play Integrity
 identities without editing the hosted manifest directly:
 
@@ -36,6 +51,10 @@ npx loomup app-integrity put-google-credential --project <project-id> \
 npx loomup app-integrity set-mode --project <project-id> --mode audit
 npx loomup app-integrity status --project <project-id>
 ```
+
+Inside a package linked to `https://tryloomup.com`, `--project` is optional for
+project-key and app-integrity commands. `--project` and `LOOMUP_PROJECT_ID`
+remain available as explicit overrides.
 
 Start in `audit` before enabling `enforce`. Use `--allow-development` only for
 a separate development identity. These commands require `loomup auth login` or
@@ -58,6 +77,9 @@ npx loomup project-keys create \
   --scope schema:plan \
   --scope schema:apply
 ```
+
+Workspace API keys are intentionally workspace-scoped, so their project list
+and create commands always require `--workspace` even when a package is linked.
 
 `loomup init` creates documented `loomup.schema.yaml` and `loomup.access.ts`
 starters and records their paths in `package.json#loomup`. It never overwrites

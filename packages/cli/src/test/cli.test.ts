@@ -326,6 +326,342 @@ test("platform authentication rejects every public URL override", async () => {
   assert.ok(logs.stderr.join("\n").includes("unknown option: --url"));
 });
 
+test("saved login discovers a workspace and creates and links a project", async () => {
+  const requests: Array<{ method?: string; path?: string; authorization?: string; body?: any }> = [];
+  let packagePath = "";
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", async () => {
+      requests.push({
+        method: request.method,
+        path: request.url,
+        authorization: request.headers.authorization,
+        body: body ? JSON.parse(body) : undefined,
+      });
+      if (request.url === "/platform/api/auth/login") {
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Set-Cookie": "loomup_platform_session=saved-session; Path=/; HttpOnly",
+        });
+        response.end(JSON.stringify({ data: { ok: true } }));
+      } else if (request.url === "/platform/api/workspaces") {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          data: [{ id: "workspace-1", name: "Personal", slug: "personal", owner_user_id: "user-1", created_at: 1 }],
+        }));
+      } else if (request.url === "/platform/api/projects") {
+        await writeFile(packagePath, JSON.stringify({
+          name: "onboarding",
+          scripts: { preserved_during_provisioning: "yes" },
+        }));
+        response.writeHead(201, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          data: {
+            project: { id: "project-1", workspace_id: "workspace-1", name: "My App", slug: "my-app" },
+            base_url: `${platformUrl}/p/project-1`,
+          },
+        }));
+      } else {
+        response.writeHead(404).end();
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-onboarding-"));
+  const credentialPath = join(directory, "credentials.json");
+  packagePath = join(directory, "package.json");
+  await writeFile(packagePath, JSON.stringify({ name: "onboarding" }));
+  const loginLogs = output();
+  const createLogs = output();
+  try {
+    assert.equal(await runCli(["auth", "login"], {
+      io: loginLogs.io,
+      platformUrl,
+      credentialPath,
+      loginCredentials: async () => ({ email: "dev@example.com", password: "secret12" }),
+    }), 0);
+    assert.ok(loginLogs.stdout.join("\n").includes("workspace-1\tPersonal"));
+    assert.equal(await runCli(["projects", "create", "--name", "My App", "--link", "--json"], {
+      cwd: directory,
+      io: createLogs.io,
+      platformUrl,
+      credentialPath,
+      interactive: false,
+    }), 0);
+  } finally {
+    server.close();
+  }
+  assert.equal(requests.filter((request) => request.path === "/platform/api/workspaces").length, 2);
+  const createRequest = requests.find((request) => request.method === "POST" && request.path === "/platform/api/projects");
+  assert.equal(createRequest?.authorization, "Bearer saved-session");
+  assert.deepEqual(createRequest?.body, { workspace_id: "workspace-1", name: "My App" });
+  const result = JSON.parse(createLogs.stdout.join("\n"));
+  assert.equal(result.local_link.package_path, join(directory, "package.json"));
+  const document = JSON.parse(await readFile(packagePath, "utf8"));
+  assert.equal(document.scripts.preserved_during_provisioning, "yes");
+  assert.equal(document.loomup.url, platformUrl);
+  assert.equal(document.loomup.project, "project-1");
+  assert.ok((await readFile(join(directory, ".loomup", "client.ts"), "utf8")).includes("/p/project-1"));
+});
+
+test("login remains successful when follow-up workspace discovery fails", async () => {
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      if (request.url === "/platform/api/auth/login") {
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Set-Cookie": "loomup_platform_session=saved-session; Path=/; HttpOnly",
+        });
+        response.end(JSON.stringify({ data: { ok: true } }));
+      } else {
+        response.writeHead(503, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "temporarily unavailable" } }));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-login-warning-"));
+  const credentialPath = join(directory, "credentials.json");
+  const logs = output();
+  try {
+    assert.equal(await runCli(["auth", "login"], {
+      io: logs.io,
+      platformUrl,
+      credentialPath,
+      loginCredentials: async () => ({ email: "dev@example.com", password: "secret12" }),
+    }), 0);
+  } finally {
+    server.close();
+  }
+  assert.ok(logs.stdout.join("\n").includes("Authenticated"));
+  assert.ok(logs.stderr.join("\n").includes("workspace discovery failed"));
+  assert.equal(JSON.parse(await readFile(credentialPath, "utf8")).token, "saved-session");
+});
+
+test("workspace commands expose empty state and create with the human session", async () => {
+  const requests: Array<{ method?: string; authorization?: string; body?: any }> = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      requests.push({
+        method: request.method,
+        authorization: request.headers.authorization,
+        body: body ? JSON.parse(body) : undefined,
+      });
+      response.writeHead(request.method === "POST" ? 201 : 200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: request.method === "POST"
+        ? { id: "workspace-1", name: "Acme", slug: "acme", owner_user_id: "user-1", created_at: 1 }
+        : [] }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  process.env.LOOMUP_PLATFORM_TOKEN = "human-session";
+  const listLogs = output();
+  const missingLogs = output();
+  const createLogs = output();
+  try {
+    assert.equal(await runCli(["workspaces", "list"], { io: listLogs.io, platformUrl }), 0);
+    assert.equal(await runCli(["projects", "create", "--name", "Missing"], {
+      io: missingLogs.io, platformUrl, interactive: false,
+    }), 2);
+    assert.equal(await runCli(["workspaces", "create", "--name", "Acme", "--json"], { io: createLogs.io, platformUrl }), 0);
+  } finally {
+    server.close();
+  }
+  assert.ok(listLogs.stdout.join("\n").includes("No workspaces found"));
+  assert.ok(missingLogs.stderr.join("\n").includes("workspaces create --name"));
+  assert.equal(JSON.parse(createLogs.stdout.join("\n")).id, "workspace-1");
+  assert.deepEqual(requests.find((request) => request.method === "POST")?.body, { name: "Acme" });
+  assert.ok(requests.every((request) => request.authorization === "Bearer human-session"));
+});
+
+test("project creation selects among multiple workspaces only when interactive", async () => {
+  const projectBodies: any[] = [];
+  const server = createServer((request, response) => {
+    if (request.method === "GET") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: [
+        { id: "workspace-1", name: "One", slug: "one", owner_user_id: "user-1", created_at: 1 },
+        { id: "workspace-2", name: "Two", slug: "two", owner_user_id: "user-1", created_at: 2 },
+      ] }));
+      return;
+    }
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      projectBodies.push(JSON.parse(body));
+      response.writeHead(201, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: {
+        project: { id: "project-2", workspace_id: "workspace-2", name: "Selected", slug: "selected" },
+        base_url: `${platformUrl}/p/project-2`,
+      } }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  process.env.LOOMUP_PLATFORM_TOKEN = "human-session";
+  const nonInteractive = output();
+  const jsonLogs = output();
+  const interactive = output();
+  let jsonPrompted = false;
+  try {
+    assert.equal(await runCli(["projects", "create", "--name", "Blocked"], {
+      io: nonInteractive.io, platformUrl, interactive: false,
+    }), 2);
+    assert.ok(nonInteractive.stderr.join("\n").includes("workspace-1"));
+    assert.ok(nonInteractive.stderr.join("\n").includes("workspace-2"));
+    assert.equal(await runCli(["projects", "create", "--name", "JSON", "--json"], {
+      io: jsonLogs.io,
+      platformUrl,
+      interactive: true,
+      workspaceChoice: async () => {
+        jsonPrompted = true;
+        return "workspace-1";
+      },
+    }), 2);
+    assert.equal(await runCli(["projects", "create", "--name", "Selected"], {
+      io: interactive.io,
+      platformUrl,
+      interactive: true,
+      workspaceChoice: async (workspaces) => {
+        assert.equal(workspaces.length, 2);
+        return "workspace-2";
+      },
+    }), 0);
+  } finally {
+    server.close();
+  }
+  assert.equal(jsonPrompted, false);
+  assert.equal(jsonLogs.stdout.length, 0);
+  assert.deepEqual(projectBodies, [{ workspace_id: "workspace-2", name: "Selected" }]);
+});
+
+test("human project listing can span workspaces while workspace keys stay scoped", async () => {
+  const paths: string[] = [];
+  const server = createServer((request, response) => {
+    paths.push(request.url ?? "");
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ data: [
+      { id: "project-1", workspace_id: "workspace-1", name: "One", slug: "one" },
+      { id: "project-2", workspace_id: "workspace-2", name: "Two", slug: "two" },
+    ] }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  process.env.LOOMUP_PLATFORM_TOKEN = "human-session";
+  const humanLogs = output();
+  const keyLogs = output();
+  const keyCreateLogs = output();
+  try {
+    assert.equal(await runCli(["projects", "list"], { io: humanLogs.io, platformUrl }), 0);
+    process.env.LOOMUP_WORKSPACE_API_KEY = "lbsk_workspace";
+    assert.equal(await runCli(["projects", "list"], { io: keyLogs.io, platformUrl }), 2);
+    assert.equal(await runCli(["projects", "create", "--name", "Blocked"], {
+      io: keyCreateLogs.io, platformUrl,
+    }), 2);
+  } finally {
+    server.close();
+  }
+  assert.deepEqual(paths, ["/platform/api/projects"]);
+  assert.ok(humanLogs.stdout.join("\n").includes("project-1\tworkspace-1\tOne"));
+  assert.ok(keyLogs.stderr.join("\n").includes("--workspace is required"));
+  assert.ok(keyCreateLogs.stderr.join("\n").includes("--workspace is required"));
+});
+
+test("project administration infers canonical linked context and rejects other origins", async () => {
+  const paths: string[] = [];
+  const server = createServer((request, response) => {
+    paths.push(request.url ?? "");
+    request.resume();
+    request.on("end", () => {
+      response.writeHead(201, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: { id: "key-1", name: "Deploy", key: "loomup_sk_once", scopes: ["schema:apply"] } }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-context-"));
+  const packagePath = join(directory, "package.json");
+  await writeFile(packagePath, JSON.stringify({ loomup: { url: platformUrl, project: "project-1" } }));
+  process.env.LOOMUP_PLATFORM_TOKEN = "human-session";
+  const inferred = output();
+  const rejected = output();
+  try {
+    assert.equal(await runCli(["project-keys", "create", "--name", "Deploy", "--scope", "schema:apply"], {
+      cwd: directory, io: inferred.io, platformUrl,
+    }), 0);
+    await writeFile(packagePath, JSON.stringify({ loomup: { url: "https://self-hosted.example", project: "project-2" } }));
+    assert.equal(await runCli(["project-keys", "list"], {
+      cwd: directory, io: rejected.io, platformUrl,
+    }), 2);
+  } finally {
+    server.close();
+  }
+  assert.deepEqual(paths, ["/platform/api/projects/project-1/studio/api-keys"]);
+  assert.ok(rejected.stderr.join("\n").includes("linked project uses https://self-hosted.example"));
+});
+
+test("create reports recovery when remote creation succeeds but local linking fails", async () => {
+  let requests = 0;
+  const server = createServer((request, response) => {
+    requests += 1;
+    request.resume();
+    request.on("end", () => {
+      response.writeHead(201, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: {
+        project: { id: "project-1", workspace_id: "workspace-1", name: "Remote", slug: "remote" },
+        base_url: `${platformUrl}/p/project-1`,
+      } }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-link-failure-"));
+  await writeFile(join(directory, "package.json"), JSON.stringify({
+    name: "failure",
+    loomup: { schema: "package.json/schema.yaml" },
+  }));
+  process.env.LOOMUP_PLATFORM_TOKEN = "human-session";
+  const preflightDirectory = await mkdtemp(join(tmpdir(), "loomup-cli-link-preflight-"));
+  const preflightLogs = output();
+  const logs = output();
+  try {
+    assert.equal(await runCli([
+      "projects", "create", "--workspace", "workspace-1", "--name", "Not Created", "--link",
+    ], { cwd: preflightDirectory, io: preflightLogs.io, platformUrl }), 2);
+    assert.equal(await runCli([
+      "projects", "create", "--workspace", "workspace-1", "--name", "Remote", "--link",
+    ], { cwd: directory, io: logs.io, platformUrl }), 1);
+  } finally {
+    server.close();
+  }
+  assert.equal(requests, 1);
+  assert.ok(preflightLogs.stderr.join("\n").includes("package.json"));
+  assert.ok(logs.stdout.join("\n").includes("Created project Remote"));
+  assert.ok(logs.stderr.join("\n").includes("was created, but local linking failed"));
+  assert.ok(logs.stderr.join("\n").includes(`loomup link --url ${platformUrl}/p/project-1`));
+});
+
 test("workspace automation commands create projects and constrained project keys", async () => {
   const requests: Array<{ path?: string; authorization?: string; body?: any }> = [];
   const server = createServer((request, response) => {
