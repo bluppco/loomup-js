@@ -28,7 +28,7 @@
     "@loomup/client": ">=0.1.0"
   },
   "devDependencies": {
-    "@loomup/client": "0.1.3",
+    "@loomup/client": "0.1.4",
     "@types/node": "^22.0.0",
     "@types/sql.js": "^1.4.11",
     "typescript": "^5.7.0"
