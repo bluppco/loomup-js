@@ -1,5 +1,5 @@
 import { onMounted, onUnmounted, ref, type Ref } from "vue";
-import { LoomupError, type AuthTokens, type OAuthProvider, type User } from "@loomup/client";
+import { LoomupError, type AuthSignUpResult, type AuthTokens, type OAuthProvider, type User } from "@loomup/client";
 import { useLoomupContext } from "./inject.js";
 import { errorMessage } from "./utils.js";
 
@@ -14,7 +14,7 @@ export type UseAuthResult = {
   loading: Ref<boolean>;
   error: Ref<string | null>;
   signIn: (creds: { email: string; password: string }) => Promise<AuthTokens>;
-  signUp: (creds: { email: string; password: string }) => Promise<AuthTokens>;
+  signUp: (creds: { email: string; password: string }) => Promise<AuthSignUpResult>;
   signInWithOAuth: (provider: OAuthProvider, redirectTo: string) => Promise<void>;
   completeOAuthSignIn: (callbackUrl?: string) => Promise<AuthTokens>;
   signOut: () => Promise<void>;
@@ -165,9 +165,17 @@ export function useAuth(): UseAuthResult {
     error.value = null;
     loading.value = true;
     try {
-      const tokens = await client.auth.signUp(creds);
-      applyTokens(tokens);
-      if (!tokens.user) {
+      const result = await client.auth.signUp(creds);
+      if (!("access_token" in result)) {
+        client.setToken(undefined);
+        client.setRefreshToken(undefined);
+        user.value = null;
+        session.value = { accessToken: undefined, refreshToken: undefined };
+        if (persist.enabled) clearTokens(persist.storageKey);
+        return result;
+      }
+      applyTokens(result);
+      if (!result.user) {
         try {
           const meUser = await client.auth.me();
           user.value = meUser;
@@ -175,7 +183,7 @@ export function useAuth(): UseAuthResult {
           /* user optional */
         }
       }
-      return tokens;
+      return result;
     } catch (err) {
       error.value = errorMessage(err);
       throw err;

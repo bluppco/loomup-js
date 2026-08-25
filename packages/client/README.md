@@ -21,18 +21,38 @@ const session = await loomup.auth.signUp({
   password: "secret12",
 });
 
-await loomup.from("todos").insert({
-  user_id: session.user.id,
-  title: "Ship Loomup",
-  completed: false,
-});
+if ("verification_required" in session) {
+  // Show a “check your inbox” screen. No session exists yet.
+  console.log(session.user.email, session.expires_in);
+} else {
+  await loomup.from("todos").insert({
+    user_id: session.user!.id,
+    title: "Ship Loomup",
+    completed: false,
+  });
 
-const unsubscribe = loomup.from("todos").subscribe((event) => {
-  console.log(event.op, event.data);
-});
+  const unsubscribe = loomup.from("todos").subscribe((event) => {
+    console.log(event.op, event.data);
+  });
 
-unsubscribe();
-loomup.closeRealtime();
+  unsubscribe();
+  loomup.closeRealtime();
+}
+```
+
+Projects with verification enabled return a pending result from `signUp`.
+Complete the emailed one-use link, or resend it, with:
+
+```ts
+await loomup.auth.resendVerification("user@example.com");
+const session = await loomup.auth.confirmVerification(token);
+
+await loomup.auth.requestPasswordReset("user@example.com");
+await loomup.auth.confirmPasswordReset({ token, password: "new-secret12" });
+
+// Trusted backend with a project:backend service key:
+await loomup.users.invite({ email: "teammate@example.com", role: "user" });
+await loomup.auth.acceptInvitation({ token, password: "secret12" });
 ```
 
 Social login uses a one-use code plus a client-held verifier:

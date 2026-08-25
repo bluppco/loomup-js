@@ -40,10 +40,67 @@ describe("createClient", () => {
     assert.equal(typeof c.auth.oauthProviders, "function");
     assert.equal(typeof c.auth.authorizeOAuth, "function");
     assert.equal(typeof c.auth.exchangeOAuthCode, "function");
+    assert.equal(typeof c.auth.resendVerification, "function");
+    assert.equal(typeof c.auth.confirmVerification, "function");
+    assert.equal(typeof c.auth.requestPasswordReset, "function");
+    assert.equal(typeof c.auth.confirmPasswordReset, "function");
+    assert.equal(typeof c.auth.acceptInvitation, "function");
     assert.equal(typeof c.users.find, "function");
     assert.equal(typeof c.users.get, "function");
+    assert.equal(typeof c.users.invite, "function");
     assert.equal(typeof c.files.from("avatars").find, "function");
     assert.equal(typeof c.files.from("avatars").create, "function");
+  });
+
+  it("returns verification-pending signup without installing a session", async () => {
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ data: {
+      verification_required: true,
+      expires_in: 86400,
+      user: { id: "u1", email: "a@b.com", role: "user", disabled: false, email_verified: false, created_at: 1 },
+    } }), { status: 202, headers: { "Content-Type": "application/json" } })) as typeof fetch;
+    try {
+      const client = createClient({ url: "https://api.test" });
+      const result = await client.auth.signUp({ email: "a@b.com", password: "secret12" });
+      assert.equal("verification_required" in result && result.verification_required, true);
+      assert.equal(client.accessToken, undefined);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  it("maps verification, reset, and invitation helpers", async () => {
+    const paths: string[] = [];
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      paths.push(path);
+      if (path.endsWith("/confirm") || path.endsWith("/accept")) {
+        if (path.includes("password-reset")) return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+        return new Response(JSON.stringify({ data: { access_token: "access", refresh_token: "refresh", token_type: "Bearer", expires_in: 900 } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: { ok: true, message: "accepted" } }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const client = createClient({ url: "https://api.test", serviceKey: "service" });
+      await client.auth.resendVerification("a@b.com");
+      await client.auth.requestPasswordReset("a@b.com");
+      await client.auth.confirmPasswordReset({ token: "one.two", password: "secret12" });
+      await client.users.invite({ email: "b@b.com" });
+      await client.auth.confirmVerification("one.two");
+      await client.auth.acceptInvitation({ token: "one.two", password: "secret12" });
+      assert.deepEqual(paths, [
+        "/auth/email-verification/resend",
+        "/auth/password-reset/request",
+        "/auth/password-reset/confirm",
+        "/auth/users/invite",
+        "/auth/email-verification/confirm",
+        "/auth/invitations/accept",
+      ]);
+      assert.equal(client.accessToken, "access");
+    } finally {
+      globalThis.fetch = previous;
+    }
   });
 
   it("maps OAuth authorize and exchange and applies the session", async () => {

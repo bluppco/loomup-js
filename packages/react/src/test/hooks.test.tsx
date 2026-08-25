@@ -21,7 +21,7 @@ import {
   type PersistOptions,
   type TokenStorage,
 } from "../index.js";
-import type { ChangeEvent, LoomupClient, SyncStore } from "@loomup/client";
+import type { AuthSignUpResult, ChangeEvent, LoomupClient, SyncStore } from "@loomup/client";
 
 // ---------------------------------------------------------------------------
 // Fake client
@@ -33,6 +33,7 @@ function createFakeClient(overrides?: {
   accessToken?: string;
   selectData?: Record<string, unknown>[];
   meUser?: { id: string; email: string; role: string; disabled: boolean; created_at: number };
+  verificationPending?: boolean;
 }) {
   const handlers = new Map<string, Set<Handler>>();
   let accessToken = overrides?.accessToken;
@@ -93,6 +94,20 @@ function createFakeClient(overrides?: {
         };
       }),
       signUp: mock.fn(async (creds: { email: string; password: string }) => {
+        if (overrides?.verificationPending) {
+          return {
+            verification_required: true as const,
+            expires_in: 86400,
+            user: {
+              id: "pending",
+              email: creds.email,
+              role: "user",
+              disabled: false,
+              email_verified: false,
+              created_at: 1,
+            },
+          };
+        }
         return client.auth.signIn(creds);
       }),
       signOut: mock.fn(async () => {
@@ -334,6 +349,24 @@ describe("useAuth", () => {
 
     assert.equal(result.current.user?.email, "x@y.com");
     assert.equal(result.current.session.accessToken, "access");
+    unmount();
+  });
+
+  it("does not expose a verification-pending signup as an authenticated user", async () => {
+    const client = createFakeClient({ verificationPending: true });
+    const { result, unmount } = await renderHook(() => useAuth(), client);
+
+    let signup: AuthSignUpResult | undefined;
+    await act(async () => {
+      signup = await result.current.signUp({
+        email: "pending@example.com",
+        password: "secret12",
+      });
+    });
+
+    assert.equal("verification_required" in signup!, true);
+    assert.equal(result.current.user, null);
+    assert.equal(result.current.session.accessToken, undefined);
     unmount();
   });
 

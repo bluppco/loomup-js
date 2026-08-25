@@ -1,5 +1,6 @@
 import type { QueryClient } from "@tanstack/query-core";
 import type {
+  AuthSignUpResult,
   AuthTokens,
   DefaultInsertMap,
   DefaultTableMap,
@@ -206,10 +207,10 @@ export function createLoomupQuery<
           mutationFn: (creds: {
             email: string;
             password: string;
-          }): Promise<AuthTokens> => client.auth.signUp(creds),
+          }): Promise<AuthSignUpResult> => client.auth.signUp(creds),
           ...(queryClient
             ? {
-                onSuccess: (data: AuthTokens) => {
+                onSuccess: (data: AuthSignUpResult) => {
                   if (data.user) {
                     queryClient.setQueryData(loomupKeys.me(), data.user);
                   }

@@ -3,7 +3,7 @@
  */
 
 import { computed, ref, type ComputedRef, type Ref } from "vue";
-import type { AuthTokens, User } from "@loomup/client";
+import type { AuthSignUpResult, AuthTokens, AuthVerificationPending, User } from "@loomup/client";
 import { useLoomupState, type LoomupPluginState } from "./useLoomup.js";
 import { errorMessage } from "./utils.js";
 
@@ -13,7 +13,7 @@ export type UseAuthResult = {
   loading: Ref<boolean>;
   error: Ref<string | null>;
   signIn: (creds: { email: string; password: string }) => Promise<AuthTokens>;
-  signUp: (creds: { email: string; password: string }) => Promise<AuthTokens>;
+  signUp: (creds: { email: string; password: string }) => Promise<AuthSignUpResult>;
   signOut: () => Promise<void>;
   refresh: () => Promise<void>;
   me: () => Promise<User | null>;
@@ -65,6 +65,16 @@ function tokensFromData(data: unknown): AuthTokens | null {
   };
 }
 
+function verificationPendingFromData(data: unknown): AuthVerificationPending | null {
+  if (!data || typeof data !== "object") return null;
+  const value = data as Record<string, unknown>;
+  if (value.verification_required !== true || typeof value.expires_in !== "number") {
+    return null;
+  }
+  if (!value.user || typeof value.user !== "object") return null;
+  return value as AuthVerificationPending;
+}
+
 export function useAuth(): UseAuthResult {
   const state: LoomupPluginState = useLoomupState();
   const loading = ref(false);
@@ -112,7 +122,7 @@ export function useAuth(): UseAuthResult {
   async function signUp(creds: {
     email: string;
     password: string;
-  }): Promise<AuthTokens> {
+  }): Promise<AuthSignUpResult> {
     loading.value = true;
     error.value = null;
     try {
@@ -125,6 +135,11 @@ export function useAuth(): UseAuthResult {
       if (tokens) {
         state.setSession(tokens);
         return tokens;
+      }
+      const pending = verificationPendingFromData(json.data);
+      if (pending) {
+        state.setSession(null);
+        return pending;
       }
       await state.refreshSession();
       return {

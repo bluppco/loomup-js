@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { LoomupError, type AuthTokens, type OAuthProvider, type User } from "@loomup/client";
+import { LoomupError, type AuthSignUpResult, type AuthTokens, type OAuthProvider, type User } from "@loomup/client";
 import { useLoomupContext } from "./context.js";
 import { clearTokens, loadTokens, saveTokens } from "./storage.js";
 import { errorMessage } from "./utils.js";
@@ -15,7 +15,7 @@ export type UseAuthResult = {
   loading: boolean;
   error: string | null;
   signIn: (creds: { email: string; password: string }) => Promise<AuthTokens>;
-  signUp: (creds: { email: string; password: string }) => Promise<AuthTokens>;
+  signUp: (creds: { email: string; password: string }) => Promise<AuthSignUpResult>;
   signInWithOAuth: (provider: OAuthProvider, redirectTo: string) => Promise<void>;
   completeOAuthSignIn: (callbackUrl?: string) => Promise<AuthTokens>;
   signOut: () => Promise<void>;
@@ -136,9 +136,19 @@ export function useAuth(): UseAuthResult {
       setError(null);
       setLoading(true);
       try {
-        const tokens = await client.auth.signUp(creds);
-        await applyTokens(tokens);
-        if (!tokens.user) {
+        const result = await client.auth.signUp(creds);
+        if (!("access_token" in result)) {
+          client.setToken(undefined);
+          client.setRefreshToken(undefined);
+          setUser(null);
+          setSession({ accessToken: undefined, refreshToken: undefined });
+          if (persist.enabled) {
+            await clearTokens(persist.storage, persist.storageKey);
+          }
+          return result;
+        }
+        await applyTokens(result);
+        if (!result.user) {
           try {
             const me = await client.auth.me();
             setUser(me);
@@ -146,7 +156,7 @@ export function useAuth(): UseAuthResult {
             /* user optional */
           }
         }
-        return tokens;
+        return result;
       } catch (err) {
         setError(errorMessage(err));
         throw err;
@@ -154,7 +164,7 @@ export function useAuth(): UseAuthResult {
         setLoading(false);
       }
     },
-    [client, applyTokens],
+    [client, applyTokens, persist.enabled, persist.storage, persist.storageKey],
   );
 
   const signOut = useCallback(async () => {

@@ -225,6 +225,9 @@ export function createAuthHandlers(options: AuthHandlersOptions) {
     const client = createClient({ url: base });
     try {
       const tokens = await client.auth.signUp({ email, password });
+      if (!("access_token" in tokens)) {
+        return { status: 202, body: { data: tokens }, cookies: [] };
+      }
       const cookieRecords = sessionCookiesFromTokens(
         tokens,
         options.cookieOptions,

@@ -47,6 +47,22 @@ export type AuthTokens = {
   user?: User;
 };
 
+export type AuthVerificationPending = {
+  verification_required: true;
+  expires_in: number;
+  user: User;
+};
+
+export type AuthSignUpResult = AuthTokens | AuthVerificationPending;
+
+export type AuthActionResult = {
+  ok: boolean;
+  message?: string;
+  expires_in?: number;
+  /** Present only for local/self-hosted password reset without email delivery. */
+  token?: string;
+};
+
 export type OAuthProvider = "google" | "apple" | "github";
 
 export type OAuthProviderInfo = {
@@ -76,6 +92,7 @@ export type User = {
   email: string;
   role: string;
   disabled: boolean;
+  email_verified?: boolean;
   password_reset_required?: boolean;
   created_at: number;
 };
@@ -84,6 +101,11 @@ export type ImportedIdentity = {
   /** Stable application user id to preserve across the migration. */
   id: string;
   email: string;
+};
+
+export type InviteUserInput = {
+  email: string;
+  role?: string;
 };
 
 export type SignedStorageUrl = {
@@ -680,6 +702,13 @@ export class LoomupClient<
       oauthProviders: () => this.oauthProviders(),
       authorizeOAuth: (input: OAuthAuthorizeInput) => this.authorizeOAuth(input),
       exchangeOAuthCode: (input: OAuthExchangeInput) => this.exchangeOAuthCode(input),
+      resendVerification: (email: string) => this.resendEmailVerification(email),
+      confirmVerification: (token: string) => this.confirmEmailVerification(token),
+      requestPasswordReset: (email: string) => this.requestPasswordReset(email),
+      confirmPasswordReset: (input: { token: string; password: string }) =>
+        this.confirmPasswordReset(input),
+      acceptInvitation: (input: { token: string; password: string }) =>
+        this.acceptInvitation(input),
       signOut: () => this.signOut(),
       logout: () => this.signOut(),
       me: () => this.me(),
@@ -1122,11 +1151,11 @@ export class LoomupClient<
     return response.data;
   }
 
-  async signUp(creds: { email: string; password: string }): Promise<AuthTokens> {
-    const res = await this.request<{ data: AuthTokens }>("POST", "/auth/register", creds, {
+  async signUp(creds: { email: string; password: string }): Promise<AuthSignUpResult> {
+    const res = await this.request<{ data: AuthSignUpResult }>("POST", "/auth/register", creds, {
       skipRetry: true,
     });
-    this.applyTokens(res.data);
+    if ("access_token" in res.data) this.applyTokens(res.data);
     return res.data;
   }
 
@@ -1161,6 +1190,61 @@ export class LoomupClient<
       "POST",
       "/auth/oauth/exchange",
       { code: input.code, code_verifier: input.codeVerifier },
+      { skipRetry: true },
+    );
+    this.applyTokens(response.data);
+    return response.data;
+  }
+
+  async resendEmailVerification(email: string): Promise<AuthActionResult> {
+    const response = await this.request<{ data: AuthActionResult }>(
+      "POST",
+      "/auth/email-verification/resend",
+      { email },
+      { skipRetry: true },
+    );
+    return response.data;
+  }
+
+  async confirmEmailVerification(token: string): Promise<AuthTokens> {
+    const response = await this.request<{ data: AuthTokens }>(
+      "POST",
+      "/auth/email-verification/confirm",
+      { token },
+      { skipRetry: true },
+    );
+    this.applyTokens(response.data);
+    return response.data;
+  }
+
+  async requestPasswordReset(email: string): Promise<AuthActionResult> {
+    const response = await this.request<{ data: AuthActionResult }>(
+      "POST",
+      "/auth/password-reset/request",
+      { email },
+      { skipRetry: true },
+    );
+    return response.data;
+  }
+
+  async confirmPasswordReset(input: {
+    token: string;
+    password: string;
+  }): Promise<AuthActionResult> {
+    const response = await this.request<{ data: AuthActionResult }>(
+      "POST",
+      "/auth/password-reset/confirm",
+      input,
+      { skipRetry: true },
+    );
+    return response.data;
+  }
+
+  async acceptInvitation(input: { token: string; password: string }): Promise<AuthTokens> {
+    const response = await this.request<{ data: AuthTokens }>(
+      "POST",
+      "/auth/invitations/accept",
+      input,
       { skipRetry: true },
     );
     this.applyTokens(response.data);
@@ -2233,6 +2317,16 @@ export class UsersResource {
       "POST",
       "/auth/users/import",
       { users: identities },
+    );
+    return response.data;
+  }
+
+  /** Server-only invitation helper. Requires a `project:backend` service key. */
+  async invite(input: InviteUserInput): Promise<AuthActionResult> {
+    const response = await this.client.request<{ data: AuthActionResult }>(
+      "POST",
+      "/auth/users/invite",
+      input,
     );
     return response.data;
   }

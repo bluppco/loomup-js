@@ -1,6 +1,6 @@
 {
   "name": "@loomup/cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Declarative schema migration CLI for Loomup projects",
   "type": "module",
   "bin": {

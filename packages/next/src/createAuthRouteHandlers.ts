@@ -216,6 +216,9 @@ export function createAuthRouteHandlers(options: AuthRouteHandlersOptions) {
     const client = createClient({ url: base });
     try {
       const tokens = await client.auth.signUp({ email, password });
+      if (!("access_token" in tokens)) {
+        return Response.json({ data: tokens }, { status: 202 });
+      }
       return withSetCookies(
         { data: publicSession(tokens, exposeAccess) },
         sessionCookiesFromTokens(tokens, options.cookieOptions),

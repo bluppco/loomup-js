@@ -1,6 +1,6 @@
 {
   "name": "@loomup/vue",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Vue 3 composables and plugin for Loomup Realtime",
   "type": "module",
   "main": "dist/index.js",

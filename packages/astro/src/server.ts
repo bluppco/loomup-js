@@ -7,6 +7,7 @@ import {
   LoomupClient,
   projectFromClient,
   type AuthTokens,
+  type AuthSignUpResult,
   type CreateClientOptions,
   type DefaultTableMap,
   type LoomupProject,
@@ -138,9 +139,9 @@ export class ServerLoomupClient<
   override async signUp(creds: {
     email: string;
     password: string;
-  }): Promise<AuthTokens> {
+  }): Promise<AuthSignUpResult> {
     const data = await super.signUp(creds);
-    this.persistFromTokens(data);
+    if ("access_token" in data) this.persistFromTokens(data);
     return data;
   }
 
@@ -209,6 +210,13 @@ export class ServerLoomupClient<
       oauthProviders: () => this.oauthProviders(),
       authorizeOAuth: (input: OAuthAuthorizeInput) => this.authorizeOAuth(input),
       exchangeOAuthCode: (input: OAuthExchangeInput) => this.exchangeOAuthCode(input),
+      resendVerification: (email: string) => this.resendEmailVerification(email),
+      confirmVerification: (token: string) => this.confirmEmailVerification(token),
+      requestPasswordReset: (email: string) => this.requestPasswordReset(email),
+      confirmPasswordReset: (input: { token: string; password: string }) =>
+        this.confirmPasswordReset(input),
+      acceptInvitation: (input: { token: string; password: string }) =>
+        this.acceptInvitation(input),
       signOut: () => this.signOut(),
       logout: () => this.signOut(),
       me: () => this.me(),
