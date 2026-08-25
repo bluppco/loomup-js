@@ -1,6 +1,6 @@
 {
   "name": "loomup-js",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "Client SDKs and schema tooling for Loomup",
   "workspaces": [
@@ -9,6 +9,9 @@
   "scripts": {
     "build": "npm run build --workspace @loomup/client && npm run build --workspace @loomup/offline && npm run build --workspace @loomup/react && npm run build --workspace @loomup/vue && npm run build --workspace @loomup/next && npm run build --workspace @loomup/nuxt && npm run build --workspace @loomup/tanstack-query && npm run build --workspace @loomup/react-native && npm run build --workspace @loomup/astro && npm run build --workspace @loomup/cli",
     "test": "npm test --workspace @loomup/client && npm test --workspace @loomup/offline && npm test --workspace @loomup/react && npm test --workspace @loomup/vue && npm test --workspace @loomup/next && npm test --workspace @loomup/nuxt && npm test --workspace @loomup/tanstack-query && npm test --workspace @loomup/react-native && npm test --workspace @loomup/astro && npm test --workspace @loomup/cli"
+  },
+  "devDependencies": {
+    "@nuxt/schema": "^3.15.0"
   },
   "engines": {
     "node": ">=18"

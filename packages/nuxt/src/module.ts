@@ -30,7 +30,7 @@ export default defineNuxtModule<ModuleOptions>({
     skewSeconds: 60,
     exposeAccessToken: true,
   },
-  setup(options: ModuleOptions, nuxt) {
+  setup(options, nuxt) {
     const resolver = createResolver(import.meta.url);
 
     const url =
