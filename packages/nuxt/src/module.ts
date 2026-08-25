@@ -10,7 +10,6 @@ import {
   addServerPlugin,
   createResolver,
 } from "@nuxt/kit";
-import type { Nuxt } from "@nuxt/schema";
 import type { ModuleOptions } from "./types.js";
 
 export type { ModuleOptions } from "./types.js";
@@ -31,7 +30,7 @@ export default defineNuxtModule<ModuleOptions>({
     skewSeconds: 60,
     exposeAccessToken: true,
   },
-  setup(options: ModuleOptions, nuxt: Nuxt) {
+  setup(options: ModuleOptions, nuxt) {
     const resolver = createResolver(import.meta.url);
 
     const url =
