@@ -1018,6 +1018,9 @@ issues:
   workspace_id: workspaces
   project_id: projects
   title: text
+$buckets:
+  attachments:
+    public: false
 `;
   const config = await loadAccessConfig(accessPath);
   const compiled = compileAccess(schema, config);
@@ -1027,6 +1030,10 @@ issues:
   assert.match(compiled.tables.issues!.read, /exists\(memberships/);
   assert.equal(compiled.tables.issues!.subscribe, compiled.tables.issues!.read);
   assert.match(compiled.tables.issues!.read, /exists\(project_members/);
+  assert.equal(compiled.tables.users!.update, "row.id = auth.uid()");
+  assert.equal(compiled.tables.users!.delete, "false");
+  assert.equal(compiled.buckets.attachments!.read, "(row.owner_id = auth.uid())");
+  assert.equal(compiled.buckets.attachments!.delete, "(row.owner_id = auth.uid())");
   assert.ok(!schema.includes("exists("));
 });
 
