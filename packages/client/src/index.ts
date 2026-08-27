@@ -28,7 +28,26 @@ export type CreateClientOptions = {
    * example in an Astro httpOnly cookie). Return a new access token to retry.
    */
   accessTokenProvider?: () => Promise<string | undefined>;
+  /**
+   * Text-frame realtime liveness watchdog. Defaults to a 25s probe interval
+   * and 12s matching-pong timeout. Set false only for staged rollouts to a
+   * server version that does not yet support application heartbeat pongs.
+   */
+  realtimeHeartbeat?: RealtimeHeartbeatOptions | false;
 };
+
+export type RealtimeHeartbeatOptions = {
+  intervalMs?: number;
+  timeoutMs?: number;
+  /** Age after which a browser resume event retires the socket immediately. */
+  staleAfterMs?: number;
+};
+
+export type RealtimeStatus =
+  | "connecting"
+  | "live"
+  | "stale"
+  | "reconnecting";
 
 /** Minimal session shape for setSession (user/expires optional). */
 export type SessionTokens = {
@@ -113,7 +132,7 @@ export type SignedStorageUrl = {
   expires_at: number;
 };
 
-export type PushProvider = "expo" | "fcm" | "apns";
+export type PushProvider = "expo" | "fcm" | "apns" | "webpush";
 export type PushPlatform = "ios" | "android" | "web" | string;
 
 export type RegisterDeviceInput = {
@@ -140,6 +159,8 @@ export type PushDevice = {
   disabled: boolean;
   disabled_reason?: string | null;
 };
+
+export type WebPushConfig = { public_key: string };
 
 export type ListMeta = {
   limit: number;
@@ -259,6 +280,7 @@ export type ControlEvent = {
   message?: string;
   code?: string;
   id?: string;
+  serverTs?: number;
 };
 
 export type SubscribeHandler = (event: ChangeEvent) => void;
@@ -571,6 +593,8 @@ export class LoomupClient<
   private readonly publishableKey?: string;
   private readonly serviceKey?: string;
   private ws?: WebSocket;
+  /** Monotonic socket identity; retired-socket events are ignored. */
+  private wsGeneration = 0;
   private subs = new Map<string, Set<SubscribeHandler>>();
   private controlHandlers = new Set<ControlHandler>();
   /** Pending subscribe acks keyed by requestId (subscribeReady waits on these). */
@@ -599,6 +623,23 @@ export class LoomupClient<
   private reconnectAttempt = 0;
   /** Timer that clears reconnectAttempt after a stable connection period. */
   private stableOpenTimer?: ReturnType<typeof setTimeout>;
+  private heartbeatIntervalTimer?: ReturnType<typeof setTimeout>;
+  private heartbeatTimeoutTimer?: ReturnType<typeof setTimeout>;
+  private pendingHeartbeatRequestId?: string;
+  private heartbeatSequence = 0;
+  private lastHeartbeatAt = 0;
+  private readonly heartbeatEnabled: boolean;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatTimeoutMs: number;
+  private readonly heartbeatStaleAfterMs: number;
+  private realtimeStatusValue: RealtimeStatus = "connecting";
+  private realtimeStatusHandlers = new Set<(status: RealtimeStatus) => void>();
+  private browserLifecycleAttached = false;
+  private readonly runtimeResumeHandler = () => this.handleRuntimeResume();
+  private readonly visibilityResumeHandler = () => {
+    const doc = (globalThis as { document?: Document }).document;
+    if (!doc || doc.visibilityState === "visible") this.handleRuntimeResume();
+  };
   /** Optional primary-key field names per table for resync id extraction. */
   private tablePrimaryKeys = new Map<string, string>();
   /** Optional token persistence hook (framework adapters). */
@@ -620,6 +661,16 @@ export class LoomupClient<
     this.onTokens = options.onTokens;
     this.accessTokenProvider = options.accessTokenProvider;
     this.authScopeValue = tokenSubject(options.token) ?? "anonymous";
+    const heartbeat = options.realtimeHeartbeat;
+    this.heartbeatEnabled = heartbeat !== false;
+    const heartbeatOptions = heartbeat === false ? undefined : heartbeat;
+    this.heartbeatIntervalMs = Math.max(1, heartbeatOptions?.intervalMs ?? 25_000);
+    this.heartbeatTimeoutMs = Math.max(1, heartbeatOptions?.timeoutMs ?? 12_000);
+    this.heartbeatStaleAfterMs = Math.max(
+      1,
+      heartbeatOptions?.staleAfterMs
+        ?? this.heartbeatIntervalMs + this.heartbeatTimeoutMs,
+    );
   }
 
   private getWsCtor(): WsCtor {
@@ -638,6 +689,17 @@ export class LoomupClient<
     return () => {
       this.controlHandlers.delete(handler);
     };
+  }
+
+  /** Current optional realtime liveness status. */
+  get realtimeStatus(): RealtimeStatus {
+    return this.realtimeStatusValue;
+  }
+
+  /** Observe realtime liveness without making status handling mandatory. */
+  onRealtimeStatus(handler: (status: RealtimeStatus) => void): () => void {
+    this.realtimeStatusHandlers.add(handler);
+    return () => this.realtimeStatusHandlers.delete(handler);
   }
 
   setToken(token: string | undefined) {
@@ -735,6 +797,7 @@ export class LoomupClient<
       unregisterDevice: (idOrToken: string | { id?: string; token?: string }) =>
         this.unregisterPushDevice(idOrToken),
       listDevices: () => this.listPushDevices(),
+      webConfig: () => this.webPushConfig(),
     };
   }
 
@@ -891,6 +954,11 @@ export class LoomupClient<
 
   async listPushDevices(): Promise<PushDevice[]> {
     const res = await this.request<{ data: PushDevice[] }>("GET", "/push/devices");
+    return res.data;
+  }
+
+  async webPushConfig(): Promise<WebPushConfig> {
+    const res = await this.request<{ data: WebPushConfig }>("GET", "/push/web-config");
     return res.data;
   }
 
@@ -1331,6 +1399,200 @@ export class LoomupClient<
     }
   }
 
+  private setRealtimeStatus(status: RealtimeStatus) {
+    if (status === this.realtimeStatusValue) return;
+    this.realtimeStatusValue = status;
+    for (const handler of this.realtimeStatusHandlers) {
+      try {
+        handler(status);
+      } catch {
+        /* status observers cannot break realtime recovery */
+      }
+    }
+  }
+
+  private isCurrentSocket(ws: WebSocket, generation: number): boolean {
+    return this.ws === ws && this.wsGeneration === generation;
+  }
+
+  private clearHeartbeatState(resetLastHeartbeat = true) {
+    if (this.heartbeatIntervalTimer) clearTimeout(this.heartbeatIntervalTimer);
+    if (this.heartbeatTimeoutTimer) clearTimeout(this.heartbeatTimeoutTimer);
+    this.heartbeatIntervalTimer = undefined;
+    this.heartbeatTimeoutTimer = undefined;
+    this.pendingHeartbeatRequestId = undefined;
+    if (resetLastHeartbeat) this.lastHeartbeatAt = 0;
+  }
+
+  private scheduleHeartbeat(ws: WebSocket, generation: number) {
+    if (
+      !this.heartbeatEnabled
+      || !this.isCurrentSocket(ws, generation)
+      || ws.readyState !== 1
+      || this.subs.size === 0
+    ) {
+      this.clearHeartbeatState(false);
+      return;
+    }
+    if (this.heartbeatIntervalTimer) clearTimeout(this.heartbeatIntervalTimer);
+    this.heartbeatIntervalTimer = setTimeout(() => {
+      this.heartbeatIntervalTimer = undefined;
+      this.sendHeartbeatProbe(ws, generation);
+    }, this.heartbeatIntervalMs);
+  }
+
+  private activateHeartbeatForCurrentSocket() {
+    if (!this.heartbeatEnabled || this.subs.size === 0) return;
+    this.attachBrowserLifecycle();
+    const ws = this.ws;
+    const generation = this.wsGeneration;
+    if (!ws || ws.readyState !== 1 || !this.isCurrentSocket(ws, generation)) return;
+    if (this.lastHeartbeatAt === 0) this.lastHeartbeatAt = Date.now();
+    this.scheduleHeartbeat(ws, generation);
+  }
+
+  private sendHeartbeatProbe(ws: WebSocket, generation: number) {
+    if (
+      !this.heartbeatEnabled
+      || !this.isCurrentSocket(ws, generation)
+      || ws.readyState !== 1
+      || this.subs.size === 0
+    ) {
+      this.clearHeartbeatState(false);
+      return;
+    }
+    if (this.heartbeatIntervalTimer) clearTimeout(this.heartbeatIntervalTimer);
+    if (this.heartbeatTimeoutTimer) clearTimeout(this.heartbeatTimeoutTimer);
+    this.heartbeatIntervalTimer = undefined;
+    this.heartbeatTimeoutTimer = undefined;
+    this.heartbeatSequence += 1;
+    const requestId = `hb_${generation}_${this.heartbeatSequence}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.pendingHeartbeatRequestId = requestId;
+    try {
+      ws.send(JSON.stringify({ type: "ping", requestId, sentAt: Date.now() }));
+    } catch {
+      this.handleHeartbeatTimeout(ws, generation);
+      return;
+    }
+    this.heartbeatTimeoutTimer = setTimeout(() => {
+      this.heartbeatTimeoutTimer = undefined;
+      if (
+        this.isCurrentSocket(ws, generation)
+        && this.pendingHeartbeatRequestId === requestId
+      ) {
+        this.handleHeartbeatTimeout(ws, generation);
+      }
+    }, this.heartbeatTimeoutMs);
+  }
+
+  private handleHeartbeatPong(
+    data: ControlEvent,
+    ws: WebSocket,
+    generation: number,
+  ): boolean {
+    if (
+      data.type !== "pong"
+      || !data.requestId
+      || !this.isCurrentSocket(ws, generation)
+      || data.requestId !== this.pendingHeartbeatRequestId
+    ) {
+      return false;
+    }
+    if (this.heartbeatTimeoutTimer) clearTimeout(this.heartbeatTimeoutTimer);
+    this.heartbeatTimeoutTimer = undefined;
+    this.pendingHeartbeatRequestId = undefined;
+    this.lastHeartbeatAt = Date.now();
+    this.setRealtimeStatus("live");
+    this.scheduleHeartbeat(ws, generation);
+    return true;
+  }
+
+  private prepareSubscriptionsForReplacement() {
+    this.acknowledgedSubscriptions.clear();
+    for (const [key, pending] of this.pendingSubscribeByKey) {
+      this.queuedSubscribeRequestIds.set(key, pending.requestId);
+    }
+  }
+
+  private retireSocket(ws: WebSocket, generation: number, reconnect: boolean) {
+    if (!this.isCurrentSocket(ws, generation)) return;
+    this.clearHeartbeatState();
+    this.prepareSubscriptionsForReplacement();
+    this.ws = undefined;
+    // Invalidate handlers before initiating close: a stuck close handshake or
+    // late close/message event cannot block or disturb the replacement socket.
+    this.wsGeneration += 1;
+    if (this.stableOpenTimer) clearTimeout(this.stableOpenTimer);
+    this.stableOpenTimer = undefined;
+    try {
+      ws.close();
+    } catch {
+      /* replacement does not depend on close handshake completion */
+    }
+    if (reconnect && this.subs.size > 0 && !this.intentionalClose) {
+      this.scheduleReconnect();
+    }
+  }
+
+  private handleHeartbeatTimeout(ws: WebSocket, generation: number) {
+    if (!this.isCurrentSocket(ws, generation)) return;
+    this.setRealtimeStatus("stale");
+    this.retireSocket(ws, generation, true);
+  }
+
+  private attachBrowserLifecycle() {
+    if (this.browserLifecycleAttached || !this.heartbeatEnabled) return;
+    const runtime = globalThis as unknown as {
+      addEventListener?: (type: string, listener: () => void) => void;
+    };
+    if (typeof runtime.addEventListener === "function") {
+      runtime.addEventListener("pageshow", this.runtimeResumeHandler);
+      runtime.addEventListener("online", this.runtimeResumeHandler);
+      this.browserLifecycleAttached = true;
+    }
+    const doc = (globalThis as { document?: Document }).document;
+    if (doc && typeof doc.addEventListener === "function") {
+      doc.addEventListener("visibilitychange", this.visibilityResumeHandler);
+      this.browserLifecycleAttached = true;
+    }
+  }
+
+  private detachBrowserLifecycle() {
+    if (!this.browserLifecycleAttached) return;
+    const runtime = globalThis as unknown as {
+      removeEventListener?: (type: string, listener: () => void) => void;
+    };
+    runtime.removeEventListener?.("pageshow", this.runtimeResumeHandler);
+    runtime.removeEventListener?.("online", this.runtimeResumeHandler);
+    const doc = (globalThis as { document?: Document }).document;
+    doc?.removeEventListener?.("visibilitychange", this.visibilityResumeHandler);
+    this.browserLifecycleAttached = false;
+  }
+
+  private handleRuntimeResume() {
+    if (!this.heartbeatEnabled || this.subs.size === 0) return;
+    const ws = this.ws;
+    const generation = this.wsGeneration;
+    if (ws && ws.readyState === 1 && this.isCurrentSocket(ws, generation)) {
+      if (
+        this.lastHeartbeatAt === 0
+        || Date.now() - this.lastHeartbeatAt >= this.heartbeatStaleAfterMs
+      ) {
+        this.setRealtimeStatus("stale");
+        this.retireSocket(ws, generation, true);
+      } else {
+        this.sendHeartbeatProbe(ws, generation);
+      }
+      return;
+    }
+    this.setRealtimeStatus("stale");
+    if (ws && this.isCurrentSocket(ws, generation)) {
+      this.retireSocket(ws, generation, true);
+    } else {
+      this.scheduleReconnect();
+    }
+  }
+
   /**
    * Re-send connection auth + subscribe for every active key using the current
    * access token. No-op when the socket is not open or there are no subs.
@@ -1362,16 +1624,11 @@ export class LoomupClient<
       this.stableOpenTimer = undefined;
     }
     const hadSubs = this.subs.size > 0;
-    const OPEN = 1;
-    const CONNECTING = 0;
-    if (
-      this.ws &&
-      (this.ws.readyState === OPEN || this.ws.readyState === CONNECTING)
-    ) {
-      // Intentional close without clearing subs; schedule reopen if needed.
+    if (this.ws) {
+      const ws = this.ws;
+      const generation = this.wsGeneration;
       this.intentionalClose = true;
-      this.ws.close();
-      this.ws = undefined;
+      this.retireSocket(ws, generation, false);
       this.intentionalClose = false;
     }
     if (hadSubs) {
@@ -1391,6 +1648,8 @@ export class LoomupClient<
       this.subs.set(key, new Set());
     }
     this.subs.get(key)!.add(handler);
+    this.attachBrowserLifecycle();
+    this.activateHeartbeatForCurrentSocket();
     return { key, isFirst };
   }
 
@@ -1414,6 +1673,14 @@ export class LoomupClient<
         };
         if (rowId) msg.id = rowId;
         this.send(msg);
+        if (this.subs.size === 0) {
+          this.clearHeartbeatState();
+          this.detachBrowserLifecycle();
+          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+          if (this.stableOpenTimer) clearTimeout(this.stableOpenTimer);
+          this.reconnectTimer = undefined;
+          this.stableOpenTimer = undefined;
+        }
       }
     };
   }
@@ -1545,18 +1812,28 @@ export class LoomupClient<
     ) {
       return;
     }
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     this.intentionalClose = false;
+    this.setRealtimeStatus(this.hasOpenedOnce ? "reconnecting" : "connecting");
     const Ws = this.getWsCtor();
     const ws = new Ws(this.wsUrl());
+    const generation = ++this.wsGeneration;
+    let opened = false;
     this.ws = ws;
     ws.onopen = () => {
+      if (!this.isCurrentSocket(ws, generation) || opened) return;
+      opened = true;
       // Reset backoff only after a stable open window so open/close flapping
       // still reaches exponential delays.
       if (this.stableOpenTimer) clearTimeout(this.stableOpenTimer);
-      this.stableOpenTimer = setTimeout(() => {
-        this.reconnectAttempt = 0;
-        this.stableOpenTimer = undefined;
-      }, LoomupClient.STABLE_OPEN_MS);
+      this.stableOpenTimer = undefined;
+      if (this.subs.size > 0) {
+        this.stableOpenTimer = setTimeout(() => {
+          this.reconnectAttempt = 0;
+          this.stableOpenTimer = undefined;
+        }, LoomupClient.STABLE_OPEN_MS);
+      }
       // Connection-level auth when we have a token.
       if (this.token) {
         this.send({ type: "auth", token: this.token });
@@ -1565,6 +1842,9 @@ export class LoomupClient<
         const { table, rowId } = parseSubKey(key);
         this.sendSubscribe(table, rowId);
       }
+      this.lastHeartbeatAt = Date.now();
+      this.setRealtimeStatus("live");
+      this.activateHeartbeatForCurrentSocket();
       // After a reconnect (not the first open), re-fetch current state so events
       // that occurred while disconnected are not silently dropped (server marks
       // CDC processed without client delivery during the outage).
@@ -1575,13 +1855,19 @@ export class LoomupClient<
       }
     };
     ws.onmessage = (ev) => {
+      if (!this.isCurrentSocket(ws, generation)) return;
       try {
-        const data = JSON.parse(String(ev.data)) as ChangeEvent & ControlEvent;
+        const data = JSON.parse(String(ev.data)) as ChangeEvent | ControlEvent;
+        if (data.type === "pong") {
+          this.handleHeartbeatPong(data as ControlEvent, ws, generation);
+          return;
+        }
         if (data.type === "change") {
-          const exact = this.subs.get(makeSubKey(data.table, data.id));
-          const all = this.subs.get(data.table);
-          exact?.forEach((h) => h(data as ChangeEvent));
-          all?.forEach((h) => h(data as ChangeEvent));
+          const change = data as ChangeEvent;
+          const exact = this.subs.get(makeSubKey(change.table, change.id));
+          const all = this.subs.get(change.table);
+          exact?.forEach((h) => h(change));
+          all?.forEach((h) => h(change));
           return;
         }
         // Resolve subscribeReady waiters before fan-out to control handlers.
@@ -1595,11 +1881,11 @@ export class LoomupClient<
       }
     };
     ws.onclose = () => {
+      if (!this.isCurrentSocket(ws, generation)) return;
+      this.clearHeartbeatState();
       this.ws = undefined;
-      this.acknowledgedSubscriptions.clear();
-      for (const [key, pending] of this.pendingSubscribeByKey) {
-        this.queuedSubscribeRequestIds.set(key, pending.requestId);
-      }
+      this.wsGeneration += 1;
+      this.prepareSubscriptionsForReplacement();
       // Connection did not stay open long enough — keep backoff counter.
       if (this.stableOpenTimer) {
         clearTimeout(this.stableOpenTimer);
@@ -1616,13 +1902,18 @@ export class LoomupClient<
    * Base 1s, doubles each attempt, caps at 30s; delay = random(0, min(cap, base*2^n)).
    */
   private scheduleReconnect() {
+    if (this.intentionalClose || this.subs.size === 0 || this.reconnectTimer) return;
+    this.setRealtimeStatus("reconnecting");
     const baseMs = 1000;
     const capMs = 30_000;
     const exp = Math.min(capMs, baseMs * Math.pow(2, this.reconnectAttempt));
     this.reconnectAttempt += 1;
     // Full jitter (AWS-style): uniform in [0, exp]
     const delay = Math.floor(Math.random() * exp);
-    this.reconnectTimer = setTimeout(() => this.ensureWs(), Math.max(50, delay));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (!this.intentionalClose && this.subs.size > 0) this.ensureWs();
+    }, Math.max(50, delay));
   }
 
   /**
@@ -1744,11 +2035,19 @@ export class LoomupClient<
   async whenConnected(timeoutMs = 5000): Promise<void> {
     this.ensureWs();
     const OPEN = 1;
-    if (this.ws && this.ws.readyState === OPEN) return;
+    if (
+      this.ws
+      && this.ws.readyState === OPEN
+      && this.realtimeStatusValue === "live"
+    ) return;
     const start = Date.now();
     return new Promise((resolve, reject) => {
       const tick = () => {
-        if (this.ws && this.ws.readyState === OPEN) {
+        if (
+          this.ws
+          && this.ws.readyState === OPEN
+          && this.realtimeStatusValue === "live"
+        ) {
           resolve();
           return;
         }
@@ -1775,15 +2074,22 @@ export class LoomupClient<
     this.intentionalClose = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.stableOpenTimer) clearTimeout(this.stableOpenTimer);
+    this.reconnectTimer = undefined;
     this.stableOpenTimer = undefined;
-    this.ws?.close();
-    this.ws = undefined;
+    this.clearHeartbeatState();
+    this.detachBrowserLifecycle();
+    if (this.ws) {
+      this.retireSocket(this.ws, this.wsGeneration, false);
+    } else {
+      this.wsGeneration += 1;
+    }
     this.subs.clear();
     this.acknowledgedSubscriptions.clear();
     this.queuedSubscribeRequestIds.clear();
     this.subscribeRequestKeys.clear();
     this.hasOpenedOnce = false;
     this.reconnectAttempt = 0;
+    this.setRealtimeStatus("connecting");
     // Fail any in-flight subscribeReady waiters immediately (don't leave them
     // hanging until timeout after intentional close).
     for (const [id, pending] of this.pendingSubscribeAcks) {

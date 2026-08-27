@@ -47,6 +47,12 @@ export type WorkspaceProjectAccess<TTables = Record<string, unknown>> = {
   memberContent?: readonly TableName<TTables>[];
   /** Comment roots: project readers may create; authors may update/delete. */
   comments?: readonly TableName<TTables>[];
+  /** Server-projected inbox rows visible and acknowledgeable only by their recipient. */
+  notifications?: readonly {
+    table: TableName<TTables>;
+    /** Defaults to `recipient_id`. */
+    recipientField?: string;
+  }[];
   /** Staging rows owned by their creator and creatable only by project editors. */
   ownedUploads?: readonly TableName<TTables>[];
   /** Final object metadata tables used to derive private bucket access. */

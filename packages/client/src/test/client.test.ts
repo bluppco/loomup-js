@@ -995,9 +995,12 @@ describe("subscription keys with # in row id", () => {
       firstSubs.some((m) => m.id === rowId && m.table === "items"),
       `expected subscribe with full row id, got ${JSON.stringify(firstSubs)}`,
     );
-    // Simulate reconnect open path by calling onopen again (as ensureWs would).
+    // Simulate a real close/replacement rather than firing duplicate `open` on
+    // one socket; socket generations intentionally ignore duplicate late events.
     sent.length = 0;
-    instance!.onopen?.({});
+    instance!.readyState = FakeWs.CLOSED;
+    instance!.onclose?.({});
+    await new Promise((r) => setTimeout(r, 1100));
     await new Promise((r) => setTimeout(r, 20));
     const reSubs = sent
       .map((s) => JSON.parse(s) as { type: string; id?: string })
@@ -1185,6 +1188,323 @@ describe("reconnect resync", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+describe("application heartbeat liveness", () => {
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("matching pongs keep one watchdog healthy and final unsubscribe stops it", async () => {
+    const sent: Array<{ type: string; requestId?: string; token?: string }> = [];
+    class FakeWs {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = FakeWs.CONNECTING;
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      constructor(_url: string) {
+        queueMicrotask(() => {
+          this.readyState = FakeWs.OPEN;
+          this.onopen?.({});
+        });
+      }
+      send(raw: string) {
+        const frame = JSON.parse(raw) as { type: string; requestId?: string; token?: string };
+        sent.push(frame);
+        if (frame.type === "ping") {
+          queueMicrotask(() => this.onmessage?.({
+            data: JSON.stringify({ type: "pong", requestId: frame.requestId, serverTs: 1 }),
+          }));
+        }
+      }
+      close() {
+        this.readyState = FakeWs.CLOSED;
+        this.onclose?.({});
+      }
+    }
+
+    const client = createClient({
+      url: "http://example.test",
+      token: "old",
+      WebSocketImpl: FakeWs as unknown as typeof WebSocket,
+      realtimeHeartbeat: { intervalMs: 15, timeoutMs: 10 },
+    });
+    const unsubscribe = client.from("todos").subscribe(() => {});
+    await wait(55);
+    assert.equal(client.realtimeStatus, "live");
+    assert.ok(sent.filter((frame) => frame.type === "ping").length >= 2);
+
+    const internal = client as unknown as {
+      heartbeatIntervalTimer?: unknown;
+      heartbeatTimeoutTimer?: unknown;
+    };
+    const intervalTimer = internal.heartbeatIntervalTimer;
+    client.setToken("one");
+    client.setToken("two");
+    client.setToken("three");
+    assert.equal(
+      internal.heartbeatIntervalTimer,
+      intervalTimer,
+      "token rotations must not multiply watchdog timers",
+    );
+    assert.equal(internal.heartbeatTimeoutTimer, undefined);
+
+    unsubscribe();
+    assert.equal(internal.heartbeatIntervalTimer, undefined);
+    assert.equal(internal.heartbeatTimeoutTimer, undefined);
+    const afterUnsubscribe = sent.filter((frame) => frame.type === "ping").length;
+    await wait(40);
+    assert.equal(sent.filter((frame) => frame.type === "ping").length, afterUnsubscribe);
+    client.closeRealtime();
+    assert.equal(internal.heartbeatIntervalTimer, undefined);
+    assert.equal(internal.heartbeatTimeoutTimer, undefined);
+  });
+
+  it("missing pong retires an OPEN socket and replaces it without waiting for close", async () => {
+    const instances: FakeWs[] = [];
+    const originalRandom = Math.random;
+    Math.random = () => 0;
+    let resyncCalls = 0;
+    let fetchCalls = 0;
+    class FakeWs {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = FakeWs.CONNECTING;
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      sent: Array<{ type: string; requestId?: string; token?: string; table?: string }> = [];
+      readonly ordinal: number;
+      constructor(_url: string) {
+        this.ordinal = instances.length;
+        instances.push(this);
+        queueMicrotask(() => {
+          this.readyState = FakeWs.OPEN;
+          this.onopen?.({});
+        });
+      }
+      send(raw: string) {
+        const frame = JSON.parse(raw) as {
+          type: string;
+          requestId?: string;
+          token?: string;
+          table?: string;
+        };
+        this.sent.push(frame);
+        if (this.ordinal > 0 && frame.type === "ping") {
+          queueMicrotask(() => this.onmessage?.({
+            data: JSON.stringify({ type: "pong", requestId: frame.requestId, serverTs: 1 }),
+          }));
+        }
+      }
+      close() {
+        if (this.ordinal === 0) {
+          // Simulate a browser/proxy close handshake that never completes.
+          this.readyState = FakeWs.OPEN;
+          return;
+        }
+        this.readyState = FakeWs.CLOSED;
+        this.onclose?.({});
+      }
+    }
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({ data: { id: "7", title: "recovered" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const client = createClient({
+        url: "http://example.test",
+        token: "fresh",
+        WebSocketImpl: FakeWs as unknown as typeof WebSocket,
+        realtimeHeartbeat: { intervalMs: 10, timeoutMs: 12 },
+      });
+      const internal = client as unknown as {
+        resyncSubscriptions: () => Promise<void>;
+      };
+      const originalResync = internal.resyncSubscriptions.bind(client);
+      internal.resyncSubscriptions = async () => {
+        resyncCalls += 1;
+        await originalResync();
+      };
+      const unsubscribe = client.from("todos").subscribe(() => {}, "7");
+      await wait(130);
+
+      assert.equal(instances.length, 2, "watchdog must create one replacement socket");
+      assert.equal(instances[0]?.readyState, FakeWs.OPEN, "old close remained stuck");
+      assert.equal(instances[1]?.readyState, FakeWs.OPEN);
+      assert.equal(resyncCalls, 1, "replacement connection runs resync exactly once");
+      assert.equal(fetchCalls, 1);
+      assert.ok(instances[1]?.sent.some((frame) => frame.type === "auth" && frame.token === "fresh"));
+      assert.ok(instances[1]?.sent.some((frame) => frame.type === "subscribe" && frame.table === "todos"));
+      assert.equal(client.realtimeStatus, "live");
+      unsubscribe();
+      client.closeRealtime();
+    } finally {
+      globalThis.fetch = originalFetch;
+      Math.random = originalRandom;
+    }
+  });
+
+  it("mismatched pong and late retired-socket events cannot affect the replacement", async () => {
+    const instances: FakeWs[] = [];
+    const originalRandom = Math.random;
+    Math.random = () => 0;
+    let deliveredChanges = 0;
+    class FakeWs {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = FakeWs.CONNECTING;
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      sent: Array<{ type: string; requestId?: string }> = [];
+      readonly ordinal: number;
+      constructor(_url: string) {
+        this.ordinal = instances.length;
+        instances.push(this);
+        queueMicrotask(() => {
+          this.readyState = FakeWs.OPEN;
+          this.onopen?.({});
+        });
+      }
+      send(raw: string) {
+        const frame = JSON.parse(raw) as { type: string; requestId?: string };
+        this.sent.push(frame);
+        if (this.ordinal > 0 && frame.type === "ping") {
+          queueMicrotask(() => this.onmessage?.({
+            data: JSON.stringify({ type: "pong", requestId: frame.requestId }),
+          }));
+        }
+      }
+      close() {
+        this.readyState = FakeWs.CLOSED;
+        // Keep the callback for an explicitly late close below.
+      }
+    }
+
+    try {
+      const client = createClient({
+        url: "http://example.test",
+        WebSocketImpl: FakeWs as unknown as typeof WebSocket,
+        realtimeHeartbeat: { intervalMs: 10, timeoutMs: 15 },
+      });
+      const unsubscribe = client.from("todos").subscribe(() => {
+        deliveredChanges += 1;
+      });
+      await wait(14);
+      const first = instances[0]!;
+      const firstRequest = first.sent.find((frame) => frame.type === "ping")?.requestId;
+      assert.ok(firstRequest);
+      first.onmessage?.({ data: JSON.stringify({ type: "pong", requestId: "hb_stale" }) });
+      await wait(100);
+      assert.equal(instances.length, 2, "mismatched pong must not satisfy watchdog");
+      const replacement = instances[1]!;
+
+      first.onmessage?.({ data: JSON.stringify({ type: "pong", requestId: firstRequest }) });
+      first.onmessage?.({
+        data: JSON.stringify({
+          type: "change",
+          table: "todos",
+          op: "UPDATE",
+          id: "1",
+          data: { id: "1" },
+          ts: 1,
+        }),
+      });
+      first.onclose?.({});
+      await wait(25);
+      assert.equal(deliveredChanges, 0, "late retired message must be ignored");
+      assert.equal(instances.length, 2, "late close must not schedule another socket");
+      assert.equal(replacement.readyState, FakeWs.OPEN);
+      assert.equal(client.realtimeStatus, "live");
+      unsubscribe();
+      client.closeRealtime();
+    } finally {
+      Math.random = originalRandom;
+    }
+  });
+
+  it("AUTH_ERROR followed by setToken reauthenticates and restores one subscription", async () => {
+    const sent: Array<{ type: string; token?: string; table?: string }> = [];
+    let restoredChanges = 0;
+    let authErrors = 0;
+    class FakeWs {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = FakeWs.CONNECTING;
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      constructor(_url: string) {
+        queueMicrotask(() => {
+          this.readyState = FakeWs.OPEN;
+          this.onopen?.({});
+        });
+      }
+      send(raw: string) {
+        const frame = JSON.parse(raw) as { type: string; token?: string; table?: string };
+        sent.push(frame);
+        if (frame.type === "subscribe" && frame.token === "expired") {
+          queueMicrotask(() => this.onmessage?.({
+            data: JSON.stringify({ type: "error", code: "AUTH_ERROR", table: "todos" }),
+          }));
+        }
+        if (frame.type === "subscribe" && frame.token === "fresh") {
+          queueMicrotask(() => this.onmessage?.({
+            data: JSON.stringify({
+              type: "change",
+              table: "todos",
+              op: "UPDATE",
+              id: "1",
+              data: { id: "1", title: "restored" },
+              ts: 1,
+            }),
+          }));
+        }
+      }
+      close() {
+        this.readyState = FakeWs.CLOSED;
+        this.onclose?.({});
+      }
+    }
+
+    const client = createClient({
+      url: "http://example.test",
+      token: "expired",
+      WebSocketImpl: FakeWs as unknown as typeof WebSocket,
+      realtimeHeartbeat: false,
+    });
+    client.onControl((event) => {
+      if (event.code === "AUTH_ERROR") authErrors += 1;
+    });
+    const unsubscribe = client.from("todos").subscribe(() => {
+      restoredChanges += 1;
+    });
+    await wait(20);
+    assert.equal(authErrors, 1);
+    const beforeRefresh = sent.length;
+    client.setToken("fresh");
+    await wait(20);
+    const refreshFrames = sent.slice(beforeRefresh);
+    assert.equal(refreshFrames.filter((frame) => frame.type === "auth").length, 1);
+    assert.equal(refreshFrames.filter((frame) => frame.type === "subscribe").length, 1);
+    assert.equal(restoredChanges, 1);
+    unsubscribe();
+    client.closeRealtime();
   });
 });
 

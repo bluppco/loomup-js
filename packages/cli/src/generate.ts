@@ -156,7 +156,7 @@ function parseSchema(source: string): { tables: ParsedTable[]; realtimeTables: S
   const root = object(value, "schema root");
   if (!Object.keys(root).length) throw new Error("schema must declare at least one table");
 
-  const projectMetadata = new Set(["$buckets", "$policies", "$auth", "$email", "$origins", "$realtime"]);
+  const projectMetadata = new Set(["$buckets", "$policies", "$auth", "$email", "$origins", "$realtime", "$notifications", "$push"]);
   for (const key of Object.keys(root).filter((key) => key.startsWith("$"))) {
     if (!projectMetadata.has(key)) throw new Error(`unknown project metadata \`${key}\``);
   }
@@ -228,6 +228,32 @@ function parseSchema(source: string): { tables: ParsedTable[]; realtimeTables: S
       if (realtimeTables.has(value)) throw new Error(`realtime table \`${value}\` is declared more than once`);
       if (!known.has(value)) throw new Error(`realtime table \`${value}\` is not declared as an exposed schema table`);
       realtimeTables.add(value);
+    }
+  }
+  if (root.$push !== undefined) {
+    const push = object(root.$push, "`$push`");
+    const unknown = Object.keys(push).filter((key) => key !== "enabled" && key !== "tables");
+    if (unknown.length) throw new Error(`unknown \`$push\` setting \`${unknown[0]}\``);
+    if (push.enabled !== undefined && typeof push.enabled !== "boolean") {
+      throw new Error("`$push.enabled` must be true or false");
+    }
+    const declared = object(push.tables ?? {}, "`$push.tables`");
+    const known = new Map(tables.map((table) => [table.name, new Set(table.fields.map((field) => field.name))]));
+    for (const [tableName, raw] of Object.entries(declared)) {
+      const fields = known.get(tableName);
+      if (!fields) throw new Error(`push table \`${tableName}\` is not declared as an exposed schema table`);
+      const settings = object(raw, `push table \`${tableName}\``);
+      const allowed = new Set(["recipient_fields", "operations", "title", "body", "notify"]);
+      const settingUnknown = Object.keys(settings).find((key) => !allowed.has(key));
+      if (settingUnknown) throw new Error(`unknown push table setting \`${settingUnknown}\``);
+      const recipients = settings.recipient_fields ?? ["user_id"];
+      if (!Array.isArray(recipients) || !recipients.length || recipients.some((field) => typeof field !== "string" || !fields.has(field))) {
+        throw new Error(`push table \`${tableName}\` recipient_fields must name declared fields`);
+      }
+      const operations = settings.operations ?? ["insert", "update"];
+      if (!Array.isArray(operations) || !operations.length || operations.some((operation) => typeof operation !== "string" || !["insert", "update", "delete"].includes(operation.toLowerCase()))) {
+        throw new Error(`push table \`${tableName}\` operations must contain insert, update, or delete`);
+      }
     }
   }
   return { tables, realtimeTables };

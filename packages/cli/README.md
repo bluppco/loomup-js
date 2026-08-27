@@ -99,6 +99,34 @@ a separate development identity. These commands require `loomup auth login` or
 mobile security policy. Credential contents are sent write-only and never
 printed or persisted by the CLI.
 
+The same manager session can install and inspect social-login and push-provider
+credentials. Each `put` command reads a complete JSON object from disk; status
+and JSON output contain safe metadata only, never private keys or secrets.
+
+```bash
+# Google/GitHub: client_id + client_secret
+npx loomup auth-provider put google --project <project-id> --file ./google-oauth.json
+
+# Apple: client_id + team_id + key_id + private_key_p8
+npx loomup auth-provider put apple --project <project-id> --file ./apple-oauth.json
+npx loomup auth-provider status --project <project-id>
+
+# FCM accepts the raw Firebase service-account JSON.
+npx loomup push-provider put fcm --project <project-id> --file ./firebase-service-account.json
+
+# APNs JSON contains key_id, team_id, topic, private_key_p8, and production.
+npx loomup push-provider put apns --project <project-id> --file ./apns.json
+npx loomup push-provider status --project <project-id>
+```
+
+Expo works without a credential; optionally store `{ "access_token": "…" }`
+when Expo push security is enabled. Web Push uses
+`{ "public_key": "…", "private_key": "…", "subject": "mailto:…" }`.
+Use `auth-provider delete` or `push-provider delete` with a provider name to
+remove a credential. The Apple and APNs `.p8` contents belong in the
+`private_key_p8` JSON field; Web Studio also supports selecting the `.p8` file
+directly.
+
 Workspace API keys provide non-human control-plane automation without granting
 direct access to project data. Create one in **Workspace API keys**, then use it
 from CI to provision projects and issue project keys within its delegation

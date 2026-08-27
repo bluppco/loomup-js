@@ -82,6 +82,27 @@ Browsers and modern runtimes provide `WebSocket` globally. In older Node.js
 runtimes, pass a compatible implementation through `WebSocketImpl` when using
 realtime subscriptions.
 
+With at least one active subscription, the client sends a correlated
+text-frame heartbeat every 25 seconds and waits 12 seconds for the matching
+pong. If an apparently open socket stops carrying application data, the client
+retires it, reconnects with jitter, reauthenticates, resubscribes, and performs
+the existing REST resync. Late events from the retired socket are ignored.
+
+`client.realtimeStatus` reports `connecting`, `live`, `stale`, or
+`reconnecting`; `client.onRealtimeStatus(handler)` can observe transitions.
+Most applications do not need either. Timing can be adjusted for tests or
+proxy-specific deployments:
+
+```ts
+const loomup = createClient({
+  url: "https://project.example",
+  realtimeHeartbeat: { intervalMs: 25_000, timeoutMs: 12_000 },
+});
+```
+
+Deploy server text-pong support before publishing a client release with this
+watchdog enabled. The server's RFC WebSocket Ping/Pong remains independent.
+
 Additional exports:
 
 - `@loomup/client/access` — typed access-profile definitions.

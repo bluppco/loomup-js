@@ -41,6 +41,7 @@ type WorkspaceProjectConfig = {
   publishedContent?: PublishedContent[];
   memberContent?: string[];
   comments?: string[];
+  notifications?: Array<{ table: string; recipientField?: string }>;
   ownedUploads?: string[];
   objects?: Array<{ table: string; pathField?: string }>;
 };
@@ -141,6 +142,18 @@ function validateConfig(value: unknown): AccessConfig {
           pathField: item.pathField === undefined ? undefined : string(item.pathField, `objects[${index}].pathField`),
         };
       });
+  const notifications = config.notifications === undefined
+    ? []
+    : (Array.isArray(config.notifications) ? config.notifications : fail("notifications must be an array"))
+      .map((raw, index) => {
+        const item = object(raw, `notifications[${index}]`);
+        return {
+          table: string(item.table, `notifications[${index}].table`),
+          recipientField: item.recipientField === undefined
+            ? undefined
+            : string(item.recipientField, `notifications[${index}].recipientField`),
+        };
+      });
   return {
     profile,
     tables: {
@@ -157,6 +170,7 @@ function validateConfig(value: unknown): AccessConfig {
     publishedContent,
     memberContent: strings(config.memberContent, "memberContent"),
     comments: strings(config.comments, "comments"),
+    notifications,
     ownedUploads: strings(config.ownedUploads, "ownedUploads"),
     objects,
   };
@@ -221,6 +235,7 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
     t.departments, t.projectDepartments, t.invitations,
     ...(config.publishedContent ?? []).flatMap((item) => [item.table, item.departments]),
     ...(config.memberContent ?? []), ...(config.comments ?? []),
+    ...(config.notifications ?? []).map((item) => item.table),
     ...(config.ownedUploads ?? []), ...(config.objects ?? []).map((item) => item.table),
   ].filter((name): name is string => Boolean(name));
   for (const name of configuredTables) {
@@ -362,6 +377,11 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
       const read = and(member(tableName), projectReader(tableName));
       const owned = `${field(tableName, "created_by")} = auth.uid()`;
       rules = access(read, and(owned, read), and(owned, read), and(owned, read));
+    } else if ((config.notifications ?? []).some((item) => item.table === tableName)) {
+      const definition = config.notifications!.find((item) => item.table === tableName)!;
+      const recipient = `${field(tableName, definition.recipientField ?? "recipient_id")} = auth.uid()`;
+      const read = and(recipient, projectReader(tableName));
+      rules = { read, create: deny, update: read, delete: deny, subscribe: read, notify: read };
     } else {
       const commentRoot = nearestRoot(tableName, (config.comments ?? []).map((name) => ({ table: name })));
       const publishedRoot = nearestRoot(tableName, publishedRoots);

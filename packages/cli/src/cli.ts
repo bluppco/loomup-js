@@ -106,6 +106,24 @@ type AppIntegrityCredentialStatus = {
   updated_at?: number;
 };
 
+type ProviderCredentialStatus = {
+  provider: string;
+  configured: boolean;
+  credential_optional?: boolean;
+  enabled?: boolean;
+  callback_url?: string;
+  client_id?: string;
+  project_id?: string;
+  client_email?: string;
+  team_id?: string;
+  key_id?: string;
+  topic?: string;
+  subject?: string;
+  production?: boolean;
+  public_key?: string;
+  updated_at?: number;
+};
+
 type ApiEnvelope<T> = { data: T };
 
 type Workspace = {
@@ -1941,6 +1959,128 @@ async function deleteGoogleIntegrityCredential(
   return 0;
 }
 
+type ProviderFamily = "auth" | "push";
+
+function providerNames(family: ProviderFamily): string[] {
+  return family === "auth"
+    ? ["google", "apple", "github"]
+    : ["expo", "fcm", "apns", "webpush"];
+}
+
+function providerEndpoint(
+  platformUrl: string,
+  project: string,
+  family: ProviderFamily,
+  provider?: string,
+): string {
+  const suffix = provider ? `/${encodeURIComponent(provider)}` : "";
+  return `${platformUrl}/platform/api/projects/${encodeURIComponent(project)}/${family}/providers${suffix}`;
+}
+
+function providerArgument(args: string[], family: ProviderFamily, required: boolean): { provider?: string; options: string[] } {
+  const provider = args[0] && !args[0].startsWith("--") ? args[0].toLowerCase() : undefined;
+  if (required && !provider) throw new CliError("provider is required", 2);
+  if (provider && !providerNames(family).includes(provider)) {
+    throw new CliError(`provider must be one of: ${providerNames(family).join(", ")}`, 2);
+  }
+  return { provider, options: provider ? args.slice(1) : args };
+}
+
+async function providerStatus(
+  family: ProviderFamily,
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  const parsed = providerArgument(args, family, false);
+  validateOptions(parsed.options, ["--project"], ["--json"]);
+  const project = await resolveHostedProjectId(parsed.options, cwd, platformUrl);
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<ProviderCredentialStatus | ProviderCredentialStatus[]>>(
+    providerEndpoint(platformUrl, project, family, parsed.provider),
+    token,
+  );
+  if (flag(parsed.options, "--json")) {
+    io.stdout(JSON.stringify(response.data, null, 2));
+    return 0;
+  }
+  const statuses = Array.isArray(response.data) ? response.data : [response.data];
+  for (const status of statuses) {
+    const enabled = family === "auth" ? `, ${status.enabled ? "enabled" : "disabled"}` : "";
+    const configuration = status.configured
+      ? "configured"
+      : status.credential_optional
+        ? "ready (credential optional)"
+        : "not configured";
+    io.stdout(`${status.provider}: ${configuration}${enabled}`);
+    if (status.callback_url) io.stdout(`  callback: ${status.callback_url}`);
+    if (status.client_id) io.stdout(`  client: ${status.client_id}`);
+    if (status.client_email) io.stdout(`  service account: ${status.client_email}`);
+    if (status.project_id) io.stdout(`  project: ${status.project_id}`);
+    if (status.topic) io.stdout(`  topic: ${status.topic}`);
+    if (status.subject) io.stdout(`  subject: ${status.subject}`);
+    if (status.public_key) io.stdout(`  public key: ${status.public_key}`);
+  }
+  return 0;
+}
+
+async function putProviderCredential(
+  family: ProviderFamily,
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  const parsed = providerArgument(args, family, true);
+  validateOptions(parsed.options, ["--project", "--file"], ["--json"]);
+  const project = await resolveHostedProjectId(parsed.options, cwd, platformUrl);
+  const file = resolve(requiredOption(parsed.options, "--file"));
+  let credential: unknown;
+  try {
+    credential = JSON.parse(await readFile(file, "utf8"));
+  } catch (error) {
+    throw new CliError(`cannot read provider credential JSON: ${String(error)}`, 2);
+  }
+  if (!credential || typeof credential !== "object" || Array.isArray(credential)) {
+    throw new CliError("provider credential must be a JSON object", 2);
+  }
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<ProviderCredentialStatus | { credential: ProviderCredentialStatus }>>(
+    providerEndpoint(platformUrl, project, family, parsed.provider),
+    token,
+    { method: "PUT", body: JSON.stringify({ credential }) },
+  );
+  const status = "credential" in response.data ? response.data.credential : response.data;
+  if (flag(parsed.options, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Configured ${family} provider ${status.provider} for project ${project}.`);
+  return 0;
+}
+
+async function deleteProviderCredential(
+  family: ProviderFamily,
+  args: string[],
+  cwd: string,
+  io: CliIO,
+  platformUrl: string,
+  credentialPath: string,
+): Promise<number> {
+  const parsed = providerArgument(args, family, true);
+  validateOptions(parsed.options, ["--project"], ["--json"]);
+  const project = await resolveHostedProjectId(parsed.options, cwd, platformUrl);
+  const token = await sessionCredential(credentialPath);
+  const response = await requestJson<ApiEnvelope<unknown>>(
+    providerEndpoint(platformUrl, project, family, parsed.provider),
+    token,
+    { method: "DELETE" },
+  );
+  if (flag(parsed.options, "--json")) io.stdout(JSON.stringify(response.data, null, 2));
+  else io.stdout(`Deleted ${family} provider ${parsed.provider} for project ${project}.`);
+  return 0;
+}
+
 function usage(io: CliIO): void {
   io.stdout(`Usage:
   loomup auth login
@@ -1965,6 +2105,12 @@ function usage(io: CliIO): void {
   loomup app-integrity set-mode [--project <id>] --mode <off|audit|enforce> [--json]
   loomup app-integrity put-google-credential [--project <id>] --file <json> [--json]
   loomup app-integrity delete-google-credential [--project <id>] [--json]
+  loomup auth-provider status [provider] [--project <id>] [--json]
+  loomup auth-provider put <google|apple|github> --file <json> [--project <id>] [--json]
+  loomup auth-provider delete <google|apple|github> [--project <id>] [--json]
+  loomup push-provider status [provider] [--project <id>] [--json]
+  loomup push-provider put <expo|fcm|apns|webpush> --file <json> [--project <id>] [--json]
+  loomup push-provider delete <expo|fcm|apns|webpush> [--project <id>] [--json]
   loomup init [--schema <path>] [--access <path>] [--output <path>]
   loomup generate [--schema <path>] [--output <path>] [--check]
   loomup migrate [--plan] [--allow-data-loss] [--json] [--schema <path>] [--access <path>]
@@ -2041,6 +2187,18 @@ export async function runCli(
       return await putGoogleIntegrityCredential(args.slice(2), cwd, io, platformUrl, credentialPath);
     if (args[0] === "app-integrity" && args[1] === "delete-google-credential")
       return await deleteGoogleIntegrityCredential(args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "auth-provider" && args[1] === "status")
+      return await providerStatus("auth", args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "auth-provider" && args[1] === "put")
+      return await putProviderCredential("auth", args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "auth-provider" && args[1] === "delete")
+      return await deleteProviderCredential("auth", args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "push-provider" && args[1] === "status")
+      return await providerStatus("push", args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "push-provider" && args[1] === "put")
+      return await putProviderCredential("push", args.slice(2), cwd, io, platformUrl, credentialPath);
+    if (args[0] === "push-provider" && args[1] === "delete")
+      return await deleteProviderCredential("push", args.slice(2), cwd, io, platformUrl, credentialPath);
     throw new CliError(`unknown command: ${args.join(" ")}`, 2);
   } catch (error) {
     const cliError = error instanceof CliError ? error : new CliError(String(error));

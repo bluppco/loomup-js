@@ -1161,6 +1161,82 @@ test("app-integrity rejects invalid numeric and certificate flags before transpo
   assert.match(badCertificate.stderr.join("\n"), /64-digit/);
 });
 
+test("auth and push provider commands use manager APIs without printing secrets", async () => {
+  const requests: Array<{ method?: string; path?: string; authorization?: string; body?: any }> = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      requests.push({
+        method: request.method,
+        path: request.url,
+        authorization: request.headers.authorization,
+        body: body ? JSON.parse(body) : undefined,
+      });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      if (request.method === "GET") {
+        response.end(request.url?.includes("/push/providers")
+          ? JSON.stringify({ data: [{
+              provider: "expo", configured: false, credential_optional: true,
+            }] })
+          : JSON.stringify({ data: {
+              provider: "google", configured: true, enabled: true,
+              client_id: "google-client", callback_url: "https://example.test/oauth/google",
+            } }));
+      } else if (request.method === "PUT") {
+        response.end(JSON.stringify({ data: { credential: { provider: "fcm", configured: true, client_email: "push@example.test" } } }));
+      } else {
+        response.end(JSON.stringify({ data: { deleted: true } }));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const platformUrl = `http://127.0.0.1:${address.port}`;
+  const directory = await mkdtemp(join(tmpdir(), "loomup-cli-providers-"));
+  const credentialPath = join(directory, "fcm.json");
+  const privateKey = "provider-secret-private-key";
+  await writeFile(credentialPath, JSON.stringify({
+    type: "service_account",
+    project_id: "firebase-project",
+    client_email: "push@example.test",
+    private_key: privateKey,
+  }));
+  process.env.LOOMUP_PLATFORM_TOKEN = "manager-session";
+  const logs = output();
+  try {
+    assert.equal(await runCli(
+      ["auth-provider", "status", "google", "--project", "project-1"],
+      { io: logs.io, platformUrl },
+    ), 0);
+    assert.equal(await runCli(
+      ["push-provider", "status", "--project", "project-1"],
+      { io: logs.io, platformUrl },
+    ), 0);
+    assert.equal(await runCli(
+      ["push-provider", "put", "fcm", "--project", "project-1", "--file", credentialPath],
+      { io: logs.io, platformUrl },
+    ), 0);
+    assert.equal(await runCli(
+      ["push-provider", "delete", "fcm", "--project", "project-1"],
+      { io: logs.io, platformUrl },
+    ), 0);
+  } finally {
+    server.close();
+  }
+  assert.deepEqual(requests.map((request) => [request.method, request.path]), [
+    ["GET", "/platform/api/projects/project-1/auth/providers/google"],
+    ["GET", "/platform/api/projects/project-1/push/providers"],
+    ["PUT", "/platform/api/projects/project-1/push/providers/fcm"],
+    ["DELETE", "/platform/api/projects/project-1/push/providers/fcm"],
+  ]);
+  assert.ok(requests.every((request) => request.authorization === "Bearer manager-session"));
+  assert.equal(requests[2]?.body.credential.private_key, privateKey);
+  assert.match(logs.stdout.join("\n"), /expo: ready \(credential optional\)/);
+  assert.doesNotMatch(logs.stdout.join("\n"), /provider-secret-private-key/);
+});
+
 test("generate emits a ready typed project client from the standalone schema", async () => {
   const directory = await mkdtemp(join(tmpdir(), "loomup-cli-generate-"));
   await writeFile(
@@ -1246,6 +1322,38 @@ projects:
   );
 });
 
+test("generated clients accept notification projection metadata", () => {
+  const source = generateClientSource(`
+$notifications:
+  table: notifications
+  events: []
+notifications:
+  recipient_id: text
+`);
+  assert.match(source, /export interface Notifications/);
+});
+
+test("generated clients validate portable push declarations", () => {
+  const source = generateClientSource(`
+$push:
+  enabled: true
+  tables:
+    messages:
+      recipient_fields: [recipient_id]
+      operations: [insert]
+      title: New message
+      body: "{{body}}"
+messages:
+  recipient_id: text
+  body: text
+`);
+  assert.match(source, /export interface Messages/);
+  assert.throws(
+    () => generateClientSource("$push:\n  tables:\n    missing: {}\nmessages:\n  user_id: text\n"),
+    /push table `missing` is not declared/,
+  );
+});
+
 test("generated clients reserve managed ids and reject custom primary keys", () => {
   assert.throws(
     () => generateClientSource("projects:\n  id: id\n  name: text\n"),
@@ -1281,7 +1389,8 @@ test("access profiles compile relationship rules without exposing the rule langu
 import type { LoomupAccessConfig } from "@loomup/client/access";
 export default {
   profile: "workspace-project",
-  memberContent: ["issues"]
+  memberContent: ["issues"],
+  notifications: [{ table: "notifications" }]
 } satisfies LoomupAccessConfig;
 `);
   const schema = `
@@ -1309,6 +1418,11 @@ issues:
   workspace_id: workspaces
   project_id: projects
   title: text
+notifications:
+  workspace_id: workspaces
+  project_id: projects
+  recipient_id: users
+  issue_id: issues
 $buckets:
   attachments:
     public: false
@@ -1316,9 +1430,12 @@ $buckets:
   const config = await loadAccessConfig(accessPath);
   const compiled = compileAccess(schema, config);
   assert.deepEqual(Object.keys(compiled.tables).sort(), [
-    "issues", "memberships", "project_members", "projects", "users", "workspaces",
+    "issues", "memberships", "notifications", "project_members", "projects", "users", "workspaces",
   ]);
   assert.match(compiled.tables.issues!.read, /exists\(memberships/);
+  assert.match(compiled.tables.notifications!.read, /row\.recipient_id = auth\.uid\(\)/);
+  assert.equal(compiled.tables.notifications!.create, "false");
+  assert.equal(compiled.tables.notifications!.notify, compiled.tables.notifications!.read);
   assert.equal(compiled.tables.issues!.subscribe, compiled.tables.issues!.read);
   assert.match(compiled.tables.issues!.read, /exists\(project_members/);
   assert.equal(compiled.tables.users!.update, "row.id = auth.uid()");
