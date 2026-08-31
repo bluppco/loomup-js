@@ -680,6 +680,60 @@ describe("request auto refresh/retry", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("surfaces a framework refresh outage instead of the original 401", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json(
+      { error: { code: "unauthorized", message: "expired" } },
+      { status: 401 },
+    )) as typeof fetch;
+    try {
+      const client = createClient({
+        url: "https://project.example",
+        token: "expired",
+        accessTokenProvider: async () => {
+          throw new LoomupError("session service unavailable", "unavailable", 503);
+        },
+      });
+      await assert.rejects(client.from("issues").select(), (error: unknown) => {
+        assert.equal((error as LoomupError).code, "unavailable");
+        assert.equal((error as LoomupError).status, 503);
+        return true;
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("surfaces an internal refresh failure instead of the original 401", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/auth/refresh")) {
+        return Response.json(
+          { error: { code: "unavailable", message: "try again" } },
+          { status: 503 },
+        );
+      }
+      return Response.json(
+        { error: { code: "unauthorized", message: "expired" } },
+        { status: 401 },
+      );
+    }) as typeof fetch;
+    try {
+      const client = createClient({
+        url: "https://project.example",
+        token: "expired",
+        refreshToken: "refresh-1",
+      });
+      await assert.rejects(client.from("issues").select(), (error: unknown) => {
+        assert.equal((error as LoomupError).code, "unavailable");
+        assert.equal((error as LoomupError).status, 503);
+        return true;
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 describe("WebSocketImpl injection", () => {

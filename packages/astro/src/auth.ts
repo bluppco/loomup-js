@@ -20,6 +20,12 @@ export type LoomupAuthHandlerOptions = CreateServerClientOptions & {
   param?: string;
   /** Exact application callback URL allowlisted in `$auth.redirect_urls`. */
   oauthCallbackUrl?: string;
+  /**
+   * Who rotates an absent access cookie for data requests. The compatibility
+   * default is `server`; browser-coordinated applications should use
+   * `client-coordinated` so only the session endpoint rotates refresh tokens.
+   */
+  dataProxyRefresh?: "server" | "client-coordinated";
 };
 
 const OAUTH_VERIFIER_COOKIE = "loomup-oauth-verifier";
@@ -270,7 +276,7 @@ async function proxyToLoomup(
   if (method !== "GET" && method !== "HEAD") assertSameOrigin(context.request);
 
   let tokens = readTokens(context.cookies, options.cookies?.names);
-  if (!tokens.access) {
+  if (!tokens.access && options.dataProxyRefresh !== "client-coordinated") {
     if (!tokens.refresh) {
       throw new LoomupError("authentication required", "unauthorized", 401);
     }

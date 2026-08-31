@@ -892,12 +892,8 @@ export class LoomupClient<
       this.refreshToken &&
       !path.startsWith("/auth/")
     ) {
-      try {
-        await this.refresh();
-        return this.requestStorage(method, path, { ...opts, skipRetry: true });
-      } catch {
-        /* fall through */
-      }
+      await this.refresh();
+      return this.requestStorage(method, path, { ...opts, skipRetry: true });
     }
     if (
       res.status === 401 &&
@@ -905,19 +901,15 @@ export class LoomupClient<
       this.accessTokenProvider &&
       !path.startsWith("/auth/")
     ) {
-      try {
-        if (!this.externalRefresh) {
-          this.externalRefresh = this.accessTokenProvider().finally(() => {
-            this.externalRefresh = null;
-          });
-        }
-        const nextToken = await this.externalRefresh;
-        if (nextToken) {
-          this.setToken(nextToken);
-          return this.requestStorage(method, path, { ...opts, skipRetry: true });
-        }
-      } catch {
-        /* fall through */
+      if (!this.externalRefresh) {
+        this.externalRefresh = this.accessTokenProvider().finally(() => {
+          this.externalRefresh = null;
+        });
+      }
+      const nextToken = await this.externalRefresh;
+      if (nextToken) {
+        this.setToken(nextToken);
+        return this.requestStorage(method, path, { ...opts, skipRetry: true });
       }
     }
     if (!res.ok) {
@@ -1130,12 +1122,8 @@ export class LoomupClient<
       path !== "/auth/login" &&
       path !== "/auth/register"
     ) {
-      try {
-        await this.refresh();
-        return this.request<T>(method, path, body, { ...opts, skipRetry: true });
-      } catch {
-        /* fall through with original error */
-      }
+      await this.refresh();
+      return this.request<T>(method, path, body, { ...opts, skipRetry: true });
     }
     if (
       res.status === 401 &&
@@ -1143,19 +1131,15 @@ export class LoomupClient<
       this.accessTokenProvider &&
       !path.startsWith("/auth/")
     ) {
-      try {
-        if (!this.externalRefresh) {
-          this.externalRefresh = this.accessTokenProvider().finally(() => {
-            this.externalRefresh = null;
-          });
-        }
-        const nextToken = await this.externalRefresh;
-        if (nextToken) {
-          this.setToken(nextToken);
-          return this.request<T>(method, path, body, { ...opts, skipRetry: true });
-        }
-      } catch {
-        /* fall through with original error */
+      if (!this.externalRefresh) {
+        this.externalRefresh = this.accessTokenProvider().finally(() => {
+          this.externalRefresh = null;
+        });
+      }
+      const nextToken = await this.externalRefresh;
+      if (nextToken) {
+        this.setToken(nextToken);
+        return this.request<T>(method, path, body, { ...opts, skipRetry: true });
       }
     }
     if (!res.ok) {

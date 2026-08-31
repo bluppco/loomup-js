@@ -52,6 +52,25 @@ Package exports:
 - `@loomup/astro/middleware` — authentication middleware.
 - `@loomup/astro/auth` — lower-level cookie authentication helpers.
 
+## Coordinated browser sessions
+
+`createAuthenticatedProject()` coordinates cookie refresh within a tab and
+across same-origin tabs. Custom browser integrations can use the same primitive:
+
+```ts
+import { createBrowserSessionCoordinator } from "@loomup/astro/client";
+
+const session = createBrowserSessionCoordinator({
+  lockName: "/api/loomup",
+  loadSession: () => fetch("/api/loomup/session").then((response) => response.json()),
+});
+```
+
+For apps where every browser request uses that coordinator, configure the auth
+handler with `dataProxyRefresh: "client-coordinated"`. This keeps single-use
+refresh rotation on the session endpoint instead of racing parallel data proxy
+requests. The compatibility default remains `"server"`.
+
 See the [Astro SDK guide](https://tryloomup.com/docs) for middleware,
 authenticated islands, object storage, and deployment guidance.
 

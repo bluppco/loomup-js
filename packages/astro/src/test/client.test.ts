@@ -1,6 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createAuthenticatedProject, createBrowserClient } from "../client.js";
+import {
+  createAuthenticatedProject,
+  createBrowserClient,
+  createBrowserSessionCoordinator,
+  LoomupError,
+} from "../client.js";
 import loomup from "../index.js";
 
 describe("createBrowserClient", () => {
@@ -62,6 +67,71 @@ describe("createAuthenticatedProject", () => {
     assert.equal(session.db.issues.name, "issues");
     assert.equal(session.db.url, "/api/loomup/data");
     assert.deepEqual(requests, ["/api/loomup/session"]);
+  });
+});
+
+describe("createBrowserSessionCoordinator", () => {
+  it("serializes refresh across tabs and reloads the winning session", async () => {
+    const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    let tail: Promise<unknown> = Promise.resolve();
+    const locks = {
+      request<T>(
+        _name: string,
+        _options: LockOptions,
+        callback: () => Promise<T>,
+      ): Promise<T> {
+        const result = tail.then(callback, callback);
+        tail = result.then(() => undefined, () => undefined);
+        return result;
+      },
+    };
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { locks },
+    });
+
+    const token = (expiresAt: number) => {
+      const payload = Buffer.from(JSON.stringify({ exp: Math.floor(expiresAt / 1_000) }))
+        .toString("base64url");
+      return `header.${payload}.signature`;
+    };
+    let generation = 0;
+    let refreshes = 0;
+    const options = {
+      lockName: "/api/loomup",
+      loadSession: async () => ({
+        token: token(generation === 0 ? Date.now() - 1_000 : Date.now() + 900_000),
+      }),
+      refreshSession: async () => {
+        refreshes += 1;
+        generation += 1;
+        return { token: token(Date.now() + 900_000) };
+      },
+      accessToken: (session: { token: string }) => session.token,
+    };
+    try {
+      const firstTab = createBrowserSessionCoordinator(options);
+      const secondTab = createBrowserSessionCoordinator(options);
+      await Promise.all([firstTab.ensureFresh(), secondTab.ensureFresh()]);
+      assert.equal(refreshes, 1);
+      assert.equal(generation, 1);
+    } finally {
+      if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+      else delete (globalThis as { navigator?: Navigator }).navigator;
+    }
+  });
+
+  it("rechecks a terminal session result once before signing out", async () => {
+    let calls = 0;
+    const coordinator = createBrowserSessionCoordinator({
+      loadSession: async () => {
+        calls += 1;
+        if (calls === 1) throw new LoomupError("lost rotation race", "invalid_token", 401);
+        return { ok: true };
+      },
+    });
+    assert.deepEqual(await coordinator.ensureFresh(), { ok: true });
+    assert.equal(calls, 2);
   });
 });
 

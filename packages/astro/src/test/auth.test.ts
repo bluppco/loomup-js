@@ -202,6 +202,28 @@ describe("createLoomupAuthHandler", () => {
     assert.deepEqual(await result.json(), { data: { id: "1", name: "Mohit" } });
   });
 
+  it("leaves refresh rotation to the coordinated client when configured", async () => {
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return Response.json({ data: {} });
+    }) as typeof fetch;
+    const store = cookies();
+    store.jar.set("loomup-refresh", "refresh-1");
+    const result = await createLoomupAuthHandler({
+      url: "https://project.example",
+      dataProxyRefresh: "client-coordinated",
+    })({
+      cookies: store,
+      params: { loomup: "data/api/issues" },
+      request: new Request("https://app.example/api/loomup/data/api/issues"),
+    });
+
+    assert.equal(result.status, 401);
+    assert.equal(called, false);
+    assert.equal(store.jar.get("loomup-refresh"), "refresh-1");
+  });
+
   it("rejects cross-origin data mutations before proxying", async () => {
     let called = false;
     globalThis.fetch = (async () => {
