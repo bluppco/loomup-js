@@ -264,9 +264,11 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
     }
     return undefined;
   };
-  const valueFrom = (from: string, target: string, targetField: string): string => {
-    const path = relationPath(from, target);
-    if (!path) fail(`cannot infer a relationship from ${from} to ${target}`);
+  const valueAlongPath = (
+    from: string,
+    path: Array<{ from: string; field: string; to: string }>,
+    targetField: string,
+  ): string => {
     if (!path.length) return field(from, targetField);
     let idExpression = field(from, path[0]!.field);
     for (let index = 1; index < path.length; index += 1) {
@@ -274,7 +276,12 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
       idExpression = `lookup(${previous}, ${path[index]!.field}, id = ${idExpression})`;
     }
     if (targetField === "id") return idExpression;
-    return `lookup(${target}, ${targetField}, id = ${idExpression})`;
+    return `lookup(${path.at(-1)!.to}, ${targetField}, id = ${idExpression})`;
+  };
+  const valueFrom = (from: string, target: string, targetField: string): string => {
+    const path = relationPath(from, target);
+    if (!path) fail(`cannot infer a relationship from ${from} to ${target}`);
+    return valueAlongPath(from, path, targetField);
   };
   const hasPath = (from: string, target: string) => relationPath(from, target) !== undefined;
   const nearestRoot = <T extends { table: string }>(from: string, roots: T[]): T | undefined =>
@@ -389,8 +396,26 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
       const publishedDepartment = publishedRoots.find((root) => root.departments === tableName);
       if (commentRoot) {
         const read = and(member(tableName), projectReader(tableName));
-        const parentOwned = `${valueFrom(tableName, commentRoot.table, "created_by")} = auth.uid()`;
-        rules = access(read, and(parentOwned, read), deny, and(parentOwned, read));
+        const parentPath = relationPath(tableName, commentRoot.table)!;
+        const parentOwned = `exists(${commentRoot.table}, id = ${valueAlongPath(tableName, parentPath, "id")}, created_by = auth.uid())`;
+        const parentFields = table(commentRoot.table).fields;
+        const consistencyTargets = new Map<string, string>();
+        for (const [fieldName, target] of table(tableName).fields) {
+          if (!target || target === commentRoot.table) continue;
+          const directScope = (fieldName === "workspace_id" && target === t.workspaces)
+            || (fieldName === "project_id" && target === t.projects);
+          if (parentFields.get(fieldName) === target || directScope) {
+            consistencyTargets.set(fieldName, target);
+          }
+        }
+        const consistentScope = [...consistencyTargets].flatMap(([fieldName, target]) => {
+          const rootToTarget = relationPath(commentRoot.table, target);
+          return rootToTarget
+            ? [`${field(tableName, fieldName)} = ${valueAlongPath(tableName, [...parentPath, ...rootToTarget], "id")}`]
+            : [];
+        });
+        const managed = and(parentOwned, ...consistentScope, read);
+        rules = access(read, managed, deny, managed);
       } else if (publishedDepartment) {
         const ownDepartment = `${field(tableName, "department_id")} = lookup(${t.memberships}, department_id, workspace_id = ${workspaceId(tableName)}, user_id = auth.uid())`;
         rules = access(or(ownDepartment, editor(tableName)), editor(tableName), editor(tableName), editor(tableName));

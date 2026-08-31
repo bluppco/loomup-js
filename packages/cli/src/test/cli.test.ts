@@ -1445,6 +1445,76 @@ $buckets:
   assert.ok(!schema.includes("exists("));
 });
 
+test("comment child rules use supported ownership checks and direct authorization scope", () => {
+  const schema = `
+users:
+  email: text
+workspaces:
+  created_by: users
+memberships:
+  workspace_id: workspaces
+  user_id: users
+  role:
+    enum: [owner, admin, member]
+projects:
+  workspace_id: workspaces
+  created_by: users
+  visibility:
+    enum: [public, private]
+  audience:
+    enum: [everyone, departments]
+project_members:
+  workspace_id: workspaces
+  project_id: projects
+  user_id: users
+issues:
+  workspace_id: workspaces
+  project_id: projects
+issue_comments:
+  workspace_id: workspaces
+  issue_id: issues
+  created_by: users
+comment_mentions:
+  workspace_id: workspaces?
+  project_id: projects?
+  issue_id: issues?
+  comment_id: issue_comments
+  user_id: users
+comment_attachments:
+  workspace_id: workspaces?
+  project_id: projects?
+  issue_id: issues?
+  comment_id: issue_comments
+  created_by: users
+  related_project_id: projects?
+`;
+  const compiled = compileAccess(schema, {
+    profile: "workspace-project",
+    comments: ["issue_comments"],
+  });
+  const rules = compiled.tables.comment_mentions!;
+
+  assert.match(rules.read, /workspace_id = row\.workspace_id/);
+  assert.match(rules.read, /project_id = row\.project_id/);
+  assert.doesNotMatch(rules.read, /lookup\(issue_comments/);
+  assert.doesNotMatch(rules.read, /lookup\(issues/);
+  assert.match(rules.create, /exists\(issue_comments, id = row\.comment_id, created_by = auth\.uid\(\)\)/);
+  assert.match(rules.create, /row\.workspace_id = lookup\(issue_comments, workspace_id, id = row\.comment_id\)/);
+  assert.match(rules.create, /row\.issue_id = lookup\(issue_comments, issue_id, id = row\.comment_id\)/);
+  assert.match(rules.create, /row\.project_id = lookup\(issues, project_id, id = lookup\(issue_comments, issue_id, id = row\.comment_id\)\)/);
+  assert.doesNotMatch(rules.create, /lookup\(issue_comments, created_by/);
+  assert.equal(rules.update, "false");
+  assert.equal(rules.delete, rules.create);
+
+  const attachmentRules = compiled.tables.comment_attachments!;
+  assert.doesNotMatch(attachmentRules.read, /lookup\(issue_comments/);
+  assert.doesNotMatch(attachmentRules.read, /lookup\(issues/);
+  assert.match(attachmentRules.create, /row\.workspace_id = lookup\(issue_comments, workspace_id, id = row\.comment_id\)/);
+  assert.match(attachmentRules.create, /row\.project_id = lookup\(issues, project_id, id = lookup\(issue_comments, issue_id, id = row\.comment_id\)\)/);
+  assert.match(attachmentRules.create, /row\.issue_id = lookup\(issue_comments, issue_id, id = row\.comment_id\)/);
+  assert.doesNotMatch(attachmentRules.create, /row\.related_project_id =/);
+});
+
 test("the executable runs when invoked through a package-manager symlink", async () => {
   const directory = await mkdtemp(join(tmpdir(), "loomup-cli-bin-"));
   const binary = join(directory, "loomup");
