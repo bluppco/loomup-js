@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { IDBFactory } from "fake-indexeddb";
 import {
   createAuthenticatedProject,
   createBrowserClient,
@@ -118,6 +119,49 @@ describe("createBrowserSessionCoordinator", () => {
     } finally {
       if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
       else delete (globalThis as { navigator?: Navigator }).navigator;
+    }
+  });
+
+  it("uses an atomic IndexedDB lease when Web Locks are unavailable", async () => {
+    const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    const originalIndexedDB = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
+    Object.defineProperty(globalThis, "indexedDB", {
+      configurable: true,
+      value: new IDBFactory(),
+    });
+
+    const token = (expiresAt: number) => {
+      const payload = Buffer.from(JSON.stringify({ exp: Math.floor(expiresAt / 1_000) }))
+        .toString("base64url");
+      return `header.${payload}.signature`;
+    };
+    let generation = 0;
+    let refreshes = 0;
+    const options = {
+      lockName: "/api/loomup-indexed-db",
+      loadSession: async () => ({
+        token: token(generation === 0 ? Date.now() - 1_000 : Date.now() + 900_000),
+      }),
+      refreshSession: async () => {
+        refreshes += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        generation += 1;
+        return { token: token(Date.now() + 900_000) };
+      },
+      accessToken: (session: { token: string }) => session.token,
+    };
+    try {
+      const firstTab = createBrowserSessionCoordinator(options);
+      const secondTab = createBrowserSessionCoordinator(options);
+      await Promise.all([firstTab.ensureFresh(), secondTab.ensureFresh()]);
+      assert.equal(refreshes, 1);
+      assert.equal(generation, 1);
+    } finally {
+      if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+      else delete (globalThis as { navigator?: Navigator }).navigator;
+      if (originalIndexedDB) Object.defineProperty(globalThis, "indexedDB", originalIndexedDB);
+      else delete (globalThis as { indexedDB?: IDBFactory }).indexedDB;
     }
   });
 

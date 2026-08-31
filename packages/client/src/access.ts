@@ -55,6 +55,8 @@ export type WorkspaceProjectAccess<TTables = Record<string, unknown>> = {
   }[];
   /** Staging rows owned by their creator and creatable only by project editors. */
   ownedUploads?: readonly TableName<TTables>[];
+  /** Tables inaccessible to user sessions and reserved for project backend keys. */
+  serviceOnly?: readonly TableName<TTables>[];
   /** Final object metadata tables used to derive private bucket access. */
   objects?: readonly {
     table: TableName<TTables>;

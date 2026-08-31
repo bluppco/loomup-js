@@ -43,6 +43,7 @@ type WorkspaceProjectConfig = {
   comments?: string[];
   notifications?: Array<{ table: string; recipientField?: string }>;
   ownedUploads?: string[];
+  serviceOnly?: string[];
   objects?: Array<{ table: string; pathField?: string }>;
 };
 
@@ -172,6 +173,7 @@ function validateConfig(value: unknown): AccessConfig {
     comments: strings(config.comments, "comments"),
     notifications,
     ownedUploads: strings(config.ownedUploads, "ownedUploads"),
+    serviceOnly: strings(config.serviceOnly, "serviceOnly"),
     objects,
   };
 }
@@ -236,7 +238,8 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
     ...(config.publishedContent ?? []).flatMap((item) => [item.table, item.departments]),
     ...(config.memberContent ?? []), ...(config.comments ?? []),
     ...(config.notifications ?? []).map((item) => item.table),
-    ...(config.ownedUploads ?? []), ...(config.objects ?? []).map((item) => item.table),
+    ...(config.ownedUploads ?? []), ...(config.serviceOnly ?? []),
+    ...(config.objects ?? []).map((item) => item.table),
   ].filter((name): name is string => Boolean(name));
   for (const name of configuredTables) {
     if (!shape.tables.has(name)) fail(`table ${JSON.stringify(name)} does not exist in the schema`);
@@ -348,7 +351,9 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
   const compiled: CompiledAccess = { tables: {}, buckets: {} };
   for (const tableName of shape.tables.keys()) {
     let rules: AccessOperations;
-    if (tableName === t.users) {
+    if ((config.serviceOnly ?? []).includes(tableName)) {
+      rules = access(deny, deny, deny, deny);
+    } else if (tableName === t.users) {
       const self = `${field(tableName, "id")} = auth.uid()`;
       rules = access(authenticated, self, self, deny);
     } else if (tableName === t.workspaces) {

@@ -1,6 +1,6 @@
 {
   "name": "@loomup/astro",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Astro integration and SSR helpers for Loomup Realtime",
   "type": "module",
   "main": "dist/index.js",
@@ -46,8 +46,9 @@
     }
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^5.7.0"
   },
   "engines": {
     "node": ">=18"

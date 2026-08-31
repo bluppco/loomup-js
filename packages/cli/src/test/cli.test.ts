@@ -1390,7 +1390,8 @@ import type { LoomupAccessConfig } from "@loomup/client/access";
 export default {
   profile: "workspace-project",
   memberContent: ["issues"],
-  notifications: [{ table: "notifications" }]
+  notifications: [{ table: "notifications" }],
+  serviceOnly: ["retained_attachments"]
 } satisfies LoomupAccessConfig;
 `);
   const schema = `
@@ -1423,6 +1424,9 @@ notifications:
   project_id: projects
   recipient_id: users
   issue_id: issues
+retained_attachments:
+  source_attachment_id: text
+  r2_key: text
 $buckets:
   attachments:
     public: false
@@ -1430,13 +1434,21 @@ $buckets:
   const config = await loadAccessConfig(accessPath);
   const compiled = compileAccess(schema, config);
   assert.deepEqual(Object.keys(compiled.tables).sort(), [
-    "issues", "memberships", "notifications", "project_members", "projects", "users", "workspaces",
+    "issues", "memberships", "notifications", "project_members", "projects", "retained_attachments", "users", "workspaces",
   ]);
   assert.match(compiled.tables.issues!.read, /exists\(memberships/);
   assert.match(compiled.tables.notifications!.read, /row\.recipient_id = auth\.uid\(\)/);
   assert.equal(compiled.tables.notifications!.create, "false");
   assert.equal(compiled.tables.notifications!.notify, compiled.tables.notifications!.read);
   assert.equal(compiled.tables.issues!.subscribe, compiled.tables.issues!.read);
+  assert.deepEqual(compiled.tables.retained_attachments, {
+    read: "false",
+    create: "false",
+    update: "false",
+    delete: "false",
+    subscribe: "false",
+    notify: "false",
+  });
   assert.match(compiled.tables.issues!.read, /exists\(project_members/);
   assert.equal(compiled.tables.users!.update, "row.id = auth.uid()");
   assert.equal(compiled.tables.users!.delete, "false");

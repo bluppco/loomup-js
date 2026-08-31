@@ -86,8 +86,17 @@ export type BrowserSessionCoordinator<TSession> = {
 };
 
 type SessionLease = { owner: string; expiresAt: number };
+type LeaseMutation = {
+  result: boolean;
+  write: "none" | "put" | "delete";
+  lease?: SessionLease;
+};
 
 let coordinatorSequence = 0;
+
+const SESSION_LOCK_DATABASE = "@loomup/astro:auth-locks";
+const SESSION_LOCK_STORE = "leases";
+const SESSION_LOCK_TTL_MS = 120_000;
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -117,9 +126,9 @@ function browserLockManager(): LockManager | undefined {
   }
 }
 
-function browserStorage(): Storage | undefined {
+function browserIndexedDB(): IDBFactory | undefined {
   try {
-    return (globalThis as { localStorage?: Storage }).localStorage;
+    return (globalThis as { indexedDB?: IDBFactory }).indexedDB;
   } catch {
     return undefined;
   }
@@ -132,21 +141,100 @@ function leaseOwner(): string {
   return `${Date.now()}-${coordinatorSequence}`;
 }
 
-function readLease(storage: Storage, key: string): SessionLease | null {
-  try {
-    const raw = storage.getItem(key);
-    if (!raw) return null;
-    const value = JSON.parse(raw) as Partial<SessionLease>;
-    if (typeof value.owner !== "string" || typeof value.expiresAt !== "number") return null;
-    return { owner: value.owner, expiresAt: value.expiresAt };
-  } catch {
-    return null;
-  }
+function storedLease(value: unknown): SessionLease | null {
+  if (!value || typeof value !== "object") return null;
+  const lease = value as Partial<SessionLease>;
+  if (typeof lease.owner !== "string" || typeof lease.expiresAt !== "number") return null;
+  return { owner: lease.owner, expiresAt: lease.expiresAt };
+}
+
+function openLeaseDatabase(factory: IDBFactory): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = factory.open(SESSION_LOCK_DATABASE, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(SESSION_LOCK_STORE)) {
+        request.result.createObjectStore(SESSION_LOCK_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("could not open session lock database"));
+    request.onblocked = () => reject(new Error("session lock database is blocked"));
+  });
+}
+
+function mutateLease(
+  database: IDBDatabase,
+  key: string,
+  decide: (current: SessionLease | null) => LeaseMutation,
+): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(SESSION_LOCK_STORE, "readwrite");
+    const store = transaction.objectStore(SESSION_LOCK_STORE);
+    const request = store.get(key);
+    let result = false;
+
+    request.onsuccess = () => {
+      const mutation = decide(storedLease(request.result));
+      result = mutation.result;
+      if (mutation.write === "put" && mutation.lease) store.put(mutation.lease, key);
+      else if (mutation.write === "delete") store.delete(key);
+    };
+    transaction.oncomplete = () => resolve(result);
+    transaction.onerror = () => reject(transaction.error ?? new Error("session lock transaction failed"));
+    transaction.onabort = () => reject(transaction.error ?? new Error("session lock transaction aborted"));
+  });
+}
+
+function acquireLease(database: IDBDatabase, key: string, owner: string): Promise<boolean> {
+  return mutateLease(database, key, (current) => {
+    if (current && current.expiresAt > Date.now()) {
+      return { result: false, write: "none" };
+    }
+    return {
+      result: true,
+      write: "put",
+      lease: { owner, expiresAt: Date.now() + SESSION_LOCK_TTL_MS },
+    };
+  });
+}
+
+function renewLease(database: IDBDatabase, key: string, owner: string): Promise<boolean> {
+  return mutateLease(database, key, (current) => current?.owner === owner
+    ? {
+      result: true,
+      write: "put",
+      lease: { owner, expiresAt: Date.now() + SESSION_LOCK_TTL_MS },
+    }
+    : { result: false, write: "none" });
+}
+
+function releaseLease(database: IDBDatabase, key: string, owner: string): Promise<boolean> {
+  return mutateLease(database, key, (current) => current?.owner === owner
+    ? { result: true, write: "delete" }
+    : { result: false, write: "none" });
 }
 
 async function withLease<T>(name: string, operation: () => Promise<T>): Promise<T> {
-  const storage = browserStorage();
-  if (!storage) return operation();
+  const factory = browserIndexedDB();
+  if (!factory) {
+    if (typeof window === "undefined") return operation();
+    throw new LoomupError(
+      "browser storage cannot coordinate session refresh",
+      "auth_lock_unavailable",
+      503,
+    );
+  }
+
+  let database: IDBDatabase;
+  try {
+    database = await openLeaseDatabase(factory);
+  } catch {
+    throw new LoomupError(
+      "browser storage cannot coordinate session refresh",
+      "auth_lock_unavailable",
+      503,
+    );
+  }
 
   const key = `@loomup/astro:auth-lock:${name}`;
   const owner = leaseOwner();
@@ -156,29 +244,22 @@ async function withLease<T>(name: string, operation: () => Promise<T>): Promise<
     : undefined;
   try {
     while (Date.now() < deadline) {
-      const current = readLease(storage, key);
-      if (!current || current.expiresAt <= Date.now()) {
+      if (await acquireLease(database, key, owner)) {
+        let heartbeatInFlight: Promise<boolean> | null = null;
+        const heartbeat = setInterval(() => {
+          if (heartbeatInFlight) return;
+          heartbeatInFlight = renewLease(database, key, owner)
+            .catch(() => false)
+            .finally(() => { heartbeatInFlight = null; });
+        }, 5_000);
         try {
-          storage.setItem(key, JSON.stringify({ owner, expiresAt: Date.now() + 15_000 }));
-        } catch {
-          return operation();
-        }
-        // localStorage has no compare-and-swap. A short settle and owner check
-        // ensures only the last contender enters the critical section.
-        await delay(20);
-        if (readLease(storage, key)?.owner === owner) {
-          const heartbeat = setInterval(() => {
-            if (readLease(storage, key)?.owner === owner) {
-              storage.setItem(key, JSON.stringify({ owner, expiresAt: Date.now() + 15_000 }));
-            }
-          }, 5_000);
-          try {
-            return await operation();
-          } finally {
-            clearInterval(heartbeat);
-            if (readLease(storage, key)?.owner === owner) storage.removeItem(key);
-            channel?.postMessage("released");
-          }
+          return await operation();
+        } finally {
+          clearInterval(heartbeat);
+          const pendingHeartbeat = heartbeatInFlight;
+          if (pendingHeartbeat) await pendingHeartbeat;
+          await releaseLease(database, key, owner).catch(() => false);
+          channel?.postMessage("released");
         }
       }
       await delay(50);
@@ -186,6 +267,7 @@ async function withLease<T>(name: string, operation: () => Promise<T>): Promise<
     throw new LoomupError("timed out waiting for session refresh", "auth_lock_timeout", 503);
   } finally {
     channel?.close();
+    database.close();
   }
 }
 

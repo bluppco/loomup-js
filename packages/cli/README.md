@@ -155,6 +155,17 @@ application profile; Loomup infers relationship access for child rows and R2
 objects, compiles the low-level rules internally, and enforces them server-side.
 Developers do not maintain `exists(...)` expressions or per-table CRUD rules.
 
+Tables used only by trusted application backends can be denied to every user
+session with `serviceOnly`. Access them with a project key carrying the
+`project:backend` capability:
+
+```ts
+export default {
+  profile: "workspace-project",
+  serviceOnly: ["retained_attachments"],
+} satisfies LoomupAccessConfig;
+```
+
 ```bash
 # Create a project API key with Schema · Apply in Loomup Studio.
 export LOOMUP_API_KEY="loomup_sk_…"
