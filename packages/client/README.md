@@ -36,7 +36,6 @@ if ("verification_required" in session) {
   });
 
   unsubscribe();
-  loomup.closeRealtime();
 }
 ```
 
@@ -51,7 +50,11 @@ await loomup.auth.requestPasswordReset("user@example.com");
 await loomup.auth.confirmPasswordReset({ token, password: "new-secret12" });
 
 // Trusted backend with a project:backend service key:
-await loomup.users.invite({ email: "teammate@example.com", role: "user" });
+await loomup.users.invite({
+  email: "teammate@example.com",
+  role: "user",
+  redirectTo: "https://app.example.com/acme/join/workspace-token",
+});
 await loomup.auth.acceptInvitation({ token, password: "secret12" });
 ```
 
@@ -81,6 +84,12 @@ app-provided secure browser/deep-link launcher.
 Browsers and modern runtimes provide `WebSocket` globally. In older Node.js
 runtimes, pass a compatible implementation through `WebSocketImpl` when using
 realtime subscriptions.
+
+The client multiplexes all active subscriptions over one WebSocket. Calling a
+subscription's returned cleanup function leaves that socket open while other
+subscriptions remain and closes it automatically after the final subscription
+is removed. Use `client.closeRealtime()` only to dispose every active realtime
+subscription at once, such as during sign-out or client replacement.
 
 With at least one active subscription, the client sends a correlated
 text-frame heartbeat every 25 seconds and waits 12 seconds for the matching

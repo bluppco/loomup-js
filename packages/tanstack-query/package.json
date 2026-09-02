@@ -1,6 +1,6 @@
 {
   "name": "@loomup/tanstack-query",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "TanStack Query helpers for the Loomup TypeScript client",
   "type": "module",
   "main": "dist/index.js",
@@ -25,7 +25,7 @@
     "@tanstack/query-core": "^5.0.0"
   },
   "devDependencies": {
-    "@loomup/client": "0.1.11",
+    "@loomup/client": "0.1.12",
     "@tanstack/query-core": "^5.66.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"

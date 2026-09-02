@@ -71,10 +71,12 @@ describe("createClient", () => {
 
   it("maps verification, reset, and invitation helpers", async () => {
     const paths: string[] = [];
+    const bodies: Array<string | undefined> = [];
     const previous = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = new URL(String(input)).pathname;
       paths.push(path);
+      bodies.push(init?.body as string | undefined);
       if (path.endsWith("/confirm") || path.endsWith("/accept")) {
         if (path.includes("password-reset")) return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
         return new Response(JSON.stringify({ data: { access_token: "access", refresh_token: "refresh", token_type: "Bearer", expires_in: 900 } }), { status: 200 });
@@ -86,7 +88,11 @@ describe("createClient", () => {
       await client.auth.resendVerification("a@b.com");
       await client.auth.requestPasswordReset("a@b.com");
       await client.auth.confirmPasswordReset({ token: "one.two", password: "secret12" });
-      await client.users.invite({ email: "b@b.com" });
+      await client.users.invite({
+        email: "b@b.com",
+        role: "user",
+        redirectTo: "https://app.example.com/acme/join/token",
+      });
       await client.auth.confirmVerification("one.two");
       await client.auth.acceptInvitation({ token: "one.two", password: "secret12" });
       assert.deepEqual(paths, [
@@ -97,6 +103,11 @@ describe("createClient", () => {
         "/auth/email-verification/confirm",
         "/auth/invitations/accept",
       ]);
+      assert.deepEqual(JSON.parse(bodies[3] ?? "{}"), {
+        email: "b@b.com",
+        role: "user",
+        redirect_to: "https://app.example.com/acme/join/token",
+      });
       assert.equal(client.accessToken, "access");
     } finally {
       globalThis.fetch = previous;
@@ -737,9 +748,10 @@ describe("request auto refresh/retry", () => {
 });
 
 describe("WebSocketImpl injection", () => {
-  it("uses injected WebSocket constructor (no global required)", () => {
+  it("uses injected WebSocket constructor and closes it on final unsubscribe", async () => {
     let constructed = false;
     let constructedUrl = "";
+    let closeCalls = 0;
     class FakeWs {
       static CONNECTING = 0;
       static OPEN = 1;
@@ -759,6 +771,7 @@ describe("WebSocketImpl injection", () => {
       }
       send(_data: string) {}
       close() {
+        closeCalls += 1;
         this.readyState = FakeWs.CLOSED;
         this.onclose?.({});
       }
@@ -775,8 +788,136 @@ describe("WebSocketImpl injection", () => {
       constructedUrl,
       "wss://cloud.example.test/p/project-1/realtime",
     );
+    await new Promise((resolve) => setTimeout(resolve, 0));
     unsub();
-    c.closeRealtime();
+    assert.equal(closeCalls, 1);
+    assert.equal(c.realtimeStatus, "connecting");
+  });
+
+  it("keeps one multiplexed socket until every subscription is removed", async () => {
+    const instances: FakeWs[] = [];
+    const sent: Array<{ type: string; table?: string }> = [];
+    let resyncCalls = 0;
+    class FakeWs {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = FakeWs.CONNECTING;
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: unknown) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      closeCalls = 0;
+      constructor(public url: string) {
+        instances.push(this);
+        queueMicrotask(() => {
+          this.readyState = FakeWs.OPEN;
+          this.onopen?.({});
+        });
+      }
+      send(raw: string) {
+        sent.push(JSON.parse(raw) as { type: string; table?: string });
+      }
+      close() {
+        this.closeCalls += 1;
+        this.readyState = FakeWs.CLOSED;
+        this.onclose?.({});
+      }
+    }
+
+    const client = createClient({
+      url: "http://localhost:3000",
+      WebSocketImpl: FakeWs as unknown as typeof WebSocket,
+      realtimeHeartbeat: false,
+    });
+    const internal = client as unknown as {
+      resyncSubscriptions: () => Promise<void>;
+    };
+    const originalResync = internal.resyncSubscriptions.bind(client);
+    internal.resyncSubscriptions = async () => {
+      resyncCalls += 1;
+      await originalResync();
+    };
+
+    const unsubscribeTodos = client.from("todos").subscribe(() => {});
+    const unsubscribeNotes = client.from("notes").subscribe(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(instances.length, 1);
+
+    unsubscribeTodos();
+    assert.equal(instances[0]?.closeCalls, 0);
+    assert.ok(sent.some((frame) => frame.type === "unsubscribe" && frame.table === "todos"));
+
+    unsubscribeNotes();
+    assert.equal(instances[0]?.closeCalls, 1);
+    assert.equal(client.realtimeStatus, "connecting");
+    assert.equal(
+      sent.some((frame) => frame.type === "unsubscribe" && frame.table === "notes"),
+      false,
+      "closing the final socket releases its remaining server subscription",
+    );
+
+    const unsubscribeAgain = client.from("todos").subscribe(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(instances.length, 2);
+    assert.equal(client.realtimeStatus, "live");
+    assert.equal(resyncCalls, 0, "a new post-idle subscription is not outage recovery");
+    unsubscribeAgain();
+    assert.equal(instances[1]?.closeCalls, 1);
+  });
+
+  it("retires a connecting socket without reconnecting or accepting late events", async () => {
+    const instances: FakeWs[] = [];
+    let delivered = 0;
+    class FakeWs {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = FakeWs.CONNECTING;
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      closeCalls = 0;
+      constructor(public url: string) {
+        instances.push(this);
+      }
+      send(_data: string) {}
+      close() {
+        this.closeCalls += 1;
+        this.readyState = FakeWs.CLOSED;
+      }
+    }
+
+    const client = createClient({
+      url: "http://localhost:3000",
+      WebSocketImpl: FakeWs as unknown as typeof WebSocket,
+      realtimeHeartbeat: false,
+    });
+    const unsubscribe = client.from("todos").subscribe(() => {
+      delivered += 1;
+    });
+    const first = instances[0]!;
+    unsubscribe();
+    assert.equal(first.closeCalls, 1);
+
+    first.readyState = FakeWs.OPEN;
+    first.onopen?.({});
+    first.onmessage?.({
+      data: JSON.stringify({
+        type: "change",
+        table: "todos",
+        op: "UPDATE",
+        id: "1",
+        data: { id: "1" },
+        ts: 1,
+      }),
+    });
+    first.onclose?.({});
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(delivered, 0);
+    assert.equal(instances.length, 1, "late events must not schedule a replacement");
+    assert.equal(client.realtimeStatus, "connecting");
   });
 
   it("surfaces generic error control frames with code", async () => {
@@ -974,12 +1115,13 @@ describe("WebSocketImpl injection", () => {
       );
       unsub();
       await new Promise((r) => setTimeout(r, 10));
-      assert.ok(
+      assert.equal(
         sent.some((s) => {
           const m = JSON.parse(s) as { type: string; id?: string };
           return m.type === "unsubscribe" && m.id === "9";
         }),
-        `expected row unsub after delete global WS: ${JSON.stringify(sent)}`,
+        false,
+        `final cleanup should close instead of sending unsubscribe: ${JSON.stringify(sent)}`,
       );
       c.closeRealtime();
     } finally {
@@ -1250,6 +1392,7 @@ describe("application heartbeat liveness", () => {
 
   it("matching pongs keep one watchdog healthy and final unsubscribe stops it", async () => {
     const sent: Array<{ type: string; requestId?: string; token?: string }> = [];
+    let closeCalls = 0;
     class FakeWs {
       static CONNECTING = 0;
       static OPEN = 1;
@@ -1275,6 +1418,7 @@ describe("application heartbeat liveness", () => {
         }
       }
       close() {
+        closeCalls += 1;
         this.readyState = FakeWs.CLOSED;
         this.onclose?.({});
       }
@@ -1309,10 +1453,13 @@ describe("application heartbeat liveness", () => {
     unsubscribe();
     assert.equal(internal.heartbeatIntervalTimer, undefined);
     assert.equal(internal.heartbeatTimeoutTimer, undefined);
+    assert.equal(closeCalls, 1);
+    assert.equal(client.realtimeStatus, "connecting");
     const afterUnsubscribe = sent.filter((frame) => frame.type === "ping").length;
     await wait(40);
     assert.equal(sent.filter((frame) => frame.type === "ping").length, afterUnsubscribe);
     client.closeRealtime();
+    assert.equal(closeCalls, 1);
     assert.equal(internal.heartbeatIntervalTimer, undefined);
     assert.equal(internal.heartbeatTimeoutTimer, undefined);
   });

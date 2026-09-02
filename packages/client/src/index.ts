@@ -125,6 +125,8 @@ export type ImportedIdentity = {
 export type InviteUserInput = {
   email: string;
   role?: string;
+  /** Optional application destination used after authentication. */
+  redirectTo?: string;
 };
 
 export type SignedStorageUrl = {
@@ -1649,6 +1651,13 @@ export class LoomupClient<
         this.subs.delete(key);
         this.acknowledgedSubscriptions.delete(key);
         this.queuedSubscribeRequestIds.delete(key);
+        // The socket is owned by the complete subscription set. Closing it
+        // when the final handler leaves prevents hook/HMR turnover from
+        // stranding an idle connection; a later subscribe starts fresh.
+        if (this.subs.size === 0) {
+          this.closeRealtime();
+          return;
+        }
         // Row-scoped unsub must include id so other row subs on the table remain.
         const msg: Record<string, unknown> = {
           type: "unsubscribe",
@@ -1657,14 +1666,6 @@ export class LoomupClient<
         };
         if (rowId) msg.id = rowId;
         this.send(msg);
-        if (this.subs.size === 0) {
-          this.clearHeartbeatState();
-          this.detachBrowserLifecycle();
-          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-          if (this.stableOpenTimer) clearTimeout(this.stableOpenTimer);
-          this.reconnectTimer = undefined;
-          this.stableOpenTimer = undefined;
-        }
       }
     };
   }
@@ -2616,7 +2617,11 @@ export class UsersResource {
     const response = await this.client.request<{ data: AuthActionResult }>(
       "POST",
       "/auth/users/invite",
-      input,
+      {
+        email: input.email,
+        role: input.role,
+        redirect_to: input.redirectTo,
+      },
     );
     return response.data;
   }
