@@ -1,6 +1,6 @@
 {
   "name": "@loomup/astro",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Astro integration and SSR helpers for Loomup Realtime",
   "type": "module",
   "main": "dist/index.js",

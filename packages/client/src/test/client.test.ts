@@ -553,6 +553,25 @@ describe("onTokens and setSession", () => {
 });
 
 describe("request auto refresh/retry", () => {
+  it("does not reinstall a token already applied by the framework refresh provider", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    let installations = 0;
+    globalThis.fetch = (async () => ++fetches === 1
+      ? Response.json({ error: { code: "unauthorized" } }, { status: 401 })
+      : Response.json({ data: [], meta: { total: 0 } })) as typeof fetch;
+    const client = createClient({ url: "https://refresh.test", token: "old", accessTokenProvider: async () => {
+      client.setToken("new");
+      return "new";
+    } });
+    const setToken = client.setToken.bind(client);
+    client.setToken = (token) => { installations++; setToken(token); };
+    try {
+      await client.from("notes").select();
+      assert.equal(installations, 1);
+      assert.equal(fetches, 2);
+    } finally { globalThis.fetch = originalFetch; client.closeRealtime(); }
+  });
   it("on 401 refreshes once and retries the original request", async () => {
     const calls: { url: string; method: string; auth?: string }[] = [];
     let access = "old-access";

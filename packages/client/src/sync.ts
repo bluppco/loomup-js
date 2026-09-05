@@ -104,6 +104,9 @@ export type SyncStoreStatus = {
   cursor: number;
   pending: number;
   conflicts: number;
+  dataRevision: number;
+  resourceRevisions: Readonly<Record<string, number>>;
+  realtime: "connecting" | "live" | "degraded" | "disabled";
   lastError?: string;
 };
 
@@ -119,9 +122,25 @@ export type SyncStoreOptions = {
   live?: boolean;
   /** Optional fallback polling. Realtime invalidation is attempted automatically. */
   pollIntervalMs?: number;
+  /** Healthy-stream reconciliation. Defaults to pollIntervalMs for compatibility. */
+  reconcileIntervalMs?: number;
+  /** Maximum batching delay from the first live invalidation. Default 120ms. */
+  liveDebounceMs?: number;
 };
 
 type LocalRecord = { data: Record<string, unknown>; version: number };
+
+/** Compare JSON values without depending on object property order. */
+function equalData(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every((key) =>
+    Object.hasOwn(right, key) && equalData(left[key], right[key]));
+}
 
 type PersistedState = {
   format: 1;
@@ -183,6 +202,21 @@ export class SyncStore {
   private pollTimer?: ReturnType<typeof setInterval>;
   private stopAuthScope?: () => void;
   private closed = false;
+  private active = true;
+  private syncTask?: Promise<void>;
+  private followup = false;
+  private forced = false;
+  private eventTimer?: ReturnType<typeof setTimeout>;
+  private stopRealtime?: () => void;
+  private stopSubscriptions?: () => void;
+  private readyResources = new Set<string>();
+  private realtime: SyncStoreStatus["realtime"] = "connecting";
+  private failures = 0;
+  private dirtyVersion = 0;
+  private persistedVersion = -1;
+  private dataRevision = 0;
+  private resourceRevisions: Record<string, number> = {};
+  private previousRows = new Map<string, Record<string, LocalRecord>>();
 
   private constructor(
     private readonly client: LoomupClient,
@@ -209,9 +243,9 @@ export class SyncStore {
     };
     const store = new SyncStore(client, normalized, options.scope ?? client.authScope);
     await store.load();
-    if (store.online) await store.run(() => store.syncInternal());
-    store.installLiveInvalidation();
     store.stopAuthScope = client.onAuthScopeChange((scope) => store.changeScopeImmediately(scope));
+    store.installLiveInvalidation();
+    if (store.online) await store.sync();
     return store;
   }
 
@@ -246,16 +280,44 @@ export class SyncStore {
       Array.isArray(loaded.conflicts)
     ) {
       this.state = loaded;
+      this.persistedVersion = this.dirtyVersion;
     } else {
       this.state = blankState(this.projectKey(), this.state.scope, this.resourcesKey());
       await this.persist();
     }
   }
 
-  private persist() {
-    return Promise.resolve(
-      this.options.storage.setItem(this.options.storageKey, JSON.stringify(this.state)),
-    );
+  private async persist() {
+    if (this.closed || this.persistedVersion === this.dirtyVersion) return;
+    const state = this.state;
+    const version = this.dirtyVersion;
+    await this.options.storage.setItem(this.options.storageKey, JSON.stringify(state));
+    if (state === this.state) this.persistedVersion = version;
+  }
+
+  private touch(resource?: string) {
+    this.dirtyVersion++;
+    if (resource && !this.previousRows.has(resource)) {
+      this.previousRows.set(resource, { ...this.state.rows[resource] });
+    }
+  }
+
+  private publishDataChanges() {
+    let changed = false;
+    for (const [resource, before] of this.previousRows) {
+      const after = this.state.rows[resource] ?? {};
+      const keys = Object.keys(before);
+      if (keys.length === Object.keys(after).length && keys.every((id) =>
+        after[id] && equalData(before[id].data, after[id].data))) continue;
+      this.resourceRevisions[resource] = (this.resourceRevisions[resource] ?? 0) + 1;
+      changed = true;
+    }
+    this.previousRows.clear();
+    if (changed) this.dataRevision++;
+  }
+
+  private assertCurrent(state: PersistedState) {
+    if (this.closed || state !== this.state) throw new Error("sync scope replaced or store closed");
   }
 
   private run(task: () => Promise<void>): Promise<void> {
@@ -271,6 +333,9 @@ export class SyncStore {
       cursor: this.state.cursor,
       pending: this.state.pending.length,
       conflicts: this.state.conflicts.length,
+      dataRevision: this.dataRevision,
+      resourceRevisions: { ...this.resourceRevisions },
+      realtime: this.realtime,
       ...(this.lastError ? { lastError: this.lastError } : {}),
     };
   }
@@ -285,9 +350,13 @@ export class SyncStore {
     return () => this.listeners.delete(listener);
   }
 
-  private notify() {
+  private notify(dataChanged = false) {
+    if (this.closed) return;
+    if (dataChanged) this.publishDataChanges();
     const status = this.status;
-    for (const listener of this.listeners) listener(status);
+    for (const listener of this.listeners) {
+      try { listener(status); } catch { /* observers cannot interrupt durable synchronization */ }
+    }
   }
 
   find(resource: string): readonly Record<string, unknown>[] {
@@ -301,6 +370,7 @@ export class SyncStore {
   }
 
   private requireResource(resource: string) {
+    if (this.closed) throw new Error("sync store closed");
     if (!this.options.resources.includes(resource)) {
       throw new Error(`resource ${resource} is not in this sync store`);
     }
@@ -311,12 +381,15 @@ export class SyncStore {
     data: Record<string, unknown>,
     options: { recordId?: string; mutationId?: string } = {},
   ): Promise<Record<string, unknown>> {
+    const state = this.state;
     let output: Record<string, unknown> = data;
     await this.run(async () => {
+      this.assertCurrent(state);
       this.requireResource(resource);
       const primaryKey = this.primaryKey(resource);
       const id = options.recordId ?? scalarId(data[primaryKey]) ?? mutationId();
       output = { ...data, [primaryKey]: id };
+      this.touch(resource);
       this.state.rows[resource] ??= {};
       this.state.rows[resource][id] = { data: output, version: 0 };
       this.state.pending.push({
@@ -327,9 +400,9 @@ export class SyncStore {
         data: output,
       });
       await this.persist();
-      this.notify();
-      if (this.online) await this.syncInternal();
+      this.notify(true);
     });
+    if (this.online) await this.sync();
     return output;
   }
 
@@ -339,13 +412,16 @@ export class SyncStore {
     patch: Record<string, unknown>,
     options: { mutationId?: string } = {},
   ): Promise<Record<string, unknown>> {
+    const state = this.state;
     let output: Record<string, unknown> = patch;
     await this.run(async () => {
+      this.assertCurrent(state);
       this.requireResource(resource);
       const key = String(id);
       const existing = this.state.rows[resource]?.[key];
       if (!existing) throw new Error(`local ${resource}/${key} not found`);
       output = { ...existing.data, ...patch };
+      this.touch(resource);
       this.state.rows[resource][key] = { data: output, version: existing.version };
       this.state.pending.push({
         id: options.mutationId ?? mutationId(),
@@ -356,9 +432,9 @@ export class SyncStore {
         base_sequence: existing.version,
       });
       await this.persist();
-      this.notify();
-      if (this.online) await this.syncInternal();
+      this.notify(true);
     });
+    if (this.online) await this.sync();
     return output;
   }
 
@@ -367,11 +443,14 @@ export class SyncStore {
     id: string | number,
     options: { mutationId?: string } = {},
   ): Promise<void> {
+    const state = this.state;
     await this.run(async () => {
+      this.assertCurrent(state);
       this.requireResource(resource);
       const key = String(id);
       const existing = this.state.rows[resource]?.[key];
       if (!existing) throw new Error(`local ${resource}/${key} not found`);
+      this.touch(resource);
       delete this.state.rows[resource][key];
       this.state.pending.push({
         id: options.mutationId ?? mutationId(),
@@ -381,32 +460,95 @@ export class SyncStore {
         base_sequence: existing.version,
       });
       await this.persist();
-      this.notify();
-      if (this.online) await this.syncInternal();
+      this.notify(true);
     });
+    if (this.online) await this.sync();
   }
 
   async sync(): Promise<void> {
-    return this.run(() => this.syncInternal());
+    return this.requestSync(true, false);
   }
 
   async setOnline(online: boolean): Promise<void> {
-    return this.run(async () => {
-      this.online = online;
-      this.phase = online ? "idle" : "offline";
+    const changed = online !== this.online;
+    this.online = online;
+    if (!online) {
+      this.phase = "offline";
+      this.clearTimers();
       this.notify();
-      if (online) await this.syncInternal();
+    } else if (changed) await this.requestSync(false, true);
+  }
+
+  /** Pause automatic work while hidden; explicit sync and durable writes still work. */
+  async setActive(active: boolean): Promise<void> {
+    const changed = active !== this.active;
+    this.active = active;
+    if (!active) this.clearTimers();
+    else if (changed) await this.requestSync(false, true);
+  }
+
+  private clearTimers() {
+    clearTimeout(this.pollTimer);
+    clearTimeout(this.eventTimer);
+    this.pollTimer = this.eventTimer = undefined;
+  }
+
+  private requestSync(force: boolean, followup: boolean): Promise<void> {
+    if (this.closed || !this.online) return Promise.resolve();
+    if (!force && !this.active) { this.followup = true; return Promise.resolve(); }
+    this.clearTimers();
+    this.forced ||= force;
+    if (this.syncTask) {
+      this.followup ||= followup;
+      return this.syncTask;
+    }
+    const task = this.run(async () => {
+      do {
+        this.followup = false;
+        await this.syncInternal();
+      } while (this.followup && !this.closed && this.online && (this.active || this.forced) && this.phase !== "error");
+    }).finally(() => {
+      this.syncTask = undefined;
+      this.forced = false;
+      this.schedulePoll();
     });
+    this.syncTask = task;
+    return task;
+  }
+
+  private invalidate() {
+    if (this.closed || !this.online) return;
+    if (!this.active) { this.followup = true; return; }
+    if (this.syncTask) { this.followup = true; return; }
+    if (this.eventTimer) return;
+    this.eventTimer = setTimeout(() => {
+      this.eventTimer = undefined;
+      void this.requestSync(false, true);
+    }, Math.max(0, this.options.liveDebounceMs ?? 120));
+  }
+
+  private schedulePoll() {
+    clearTimeout(this.pollTimer);
+    this.pollTimer = undefined;
+    if (this.closed || !this.online || !this.active) return;
+    const fallback = this.options.pollIntervalMs ?? 0;
+    const interval = this.realtime === "live" && this.failures === 0
+      ? this.options.reconcileIntervalMs ?? fallback
+      : fallback > 0 ? Math.min(Math.max(fallback, 60_000), fallback * 2 ** Math.min(Math.max(0, this.failures - 1), 3)) : 0;
+    if (interval > 0) this.pollTimer = setTimeout(() => {
+      this.pollTimer = undefined;
+      void this.requestSync(false, false);
+    }, interval);
   }
 
   async setScope(scope: string): Promise<void> {
-    this.changeScopeImmediately(scope);
-    await this.chain;
+    await this.changeScopeImmediately(scope);
   }
 
   /** Purge synchronously before any caller can read rows under a new identity. */
   private changeScopeImmediately(scope: string) {
     if (!scope || scope === this.state.scope || this.closed) return;
+    for (const resource of this.options.resources) this.touch(resource);
     this.state = blankState(
       this.projectKey(),
       scope,
@@ -415,11 +557,13 @@ export class SyncStore {
     );
     this.phase = this.online ? "syncing" : "offline";
     this.lastError = undefined;
-    this.notify();
-    void this.run(async () => {
+    this.notify(true);
+    const task = this.run(async () => {
       await this.persist();
-      if (this.online) await this.syncInternal();
-    });
+    }).then(() => this.requestSync(false, true));
+    // Auth-scope observers are synchronous; explicit setScope still observes failures.
+    void task.catch(() => undefined);
+    return task;
   }
 
   async resolveConflict(
@@ -427,11 +571,12 @@ export class SyncStore {
     resolution: "discard" | "retry",
     data?: Record<string, unknown>,
   ): Promise<void> {
-    return this.run(async () => {
+    await this.run(async () => {
       const index = this.state.conflicts.findIndex(
         (conflict) => conflict.mutation.id === mutationIdValue,
       );
       if (index < 0) return;
+      this.touch();
       const [conflict] = this.state.conflicts.splice(index, 1);
       if (resolution === "retry") {
         const current = conflict.error.details?.current;
@@ -445,21 +590,25 @@ export class SyncStore {
       await this.bootstrapInternal();
       this.applyOptimisticPending();
       await this.persist();
-      if (this.online) await this.syncInternal();
+      this.notify(true);
     });
+    if (this.online) await this.sync();
   }
 
   private async bootstrapInternal() {
+    const state = this.state;
     const response = await this.client.syncBootstrap(
       this.options.resources,
       this.state.clientId,
     );
+    this.assertCurrent(state);
     this.applyBootstrap(response);
   }
 
   private applyBootstrap(response: SyncBootstrapResponse) {
     const rows: PersistedState["rows"] = {};
     for (const resource of this.options.resources) {
+      this.touch(resource);
       rows[resource] = {};
       for (const record of response.resources[resource]?.records ?? []) {
         const id = scalarId(record.data[this.primaryKey(resource)]);
@@ -475,6 +624,7 @@ export class SyncStore {
     for (const mutation of this.state.pending) {
       const id = mutation.record_id;
       if (!id) continue;
+      this.touch(mutation.resource);
       this.state.rows[mutation.resource] ??= {};
       if (mutation.operation === "delete") {
         delete this.state.rows[mutation.resource][id];
@@ -486,7 +636,7 @@ export class SyncStore {
       } else {
         const existing = this.state.rows[mutation.resource][id];
         if (existing) {
-          existing.data = { ...existing.data, ...(mutation.data ?? {}) };
+          this.state.rows[mutation.resource][id] = { ...existing, data: { ...existing.data, ...(mutation.data ?? {}) } };
         }
       }
     }
@@ -495,10 +645,13 @@ export class SyncStore {
   private async flushPending(): Promise<boolean> {
     while (this.state.pending.length > 0) {
       const mutation = this.state.pending[0];
+      const state = this.state;
       const response = await this.client.syncMutations([mutation]);
+      this.assertCurrent(state);
       const result = response.results[0];
       if (!result) throw new Error("sync server returned no mutation result");
       if (result.status === "acknowledged" && result.sequence != null) {
+        this.touch(mutation.resource);
         this.state.pending.shift();
         const id = mutation.record_id;
         if (id && mutation.operation === "delete") {
@@ -523,6 +676,7 @@ export class SyncStore {
         continue;
       }
       if (result.status === "conflict" || result.status === "rejected") {
+        this.touch();
         this.state.pending.shift();
         this.state.conflicts.push({
           mutation,
@@ -543,6 +697,8 @@ export class SyncStore {
     this.state.rows[event.resource] ??= {};
     const existing = this.state.rows[event.resource][event.record_id];
     if (existing && existing.version >= event.sequence) return;
+    if (!existing && (event.operation === "DELETE" || !event.after)) return;
+    this.touch(event.resource);
     if (event.operation === "DELETE" || !event.after) {
       delete this.state.rows[event.resource][event.record_id];
     } else {
@@ -555,11 +711,13 @@ export class SyncStore {
 
   private async pullAll() {
     do {
+      const state = this.state;
       const response = await this.client.syncPull(
         this.state.cursor,
         this.options.resources,
         this.state.clientId,
       );
+      this.assertCurrent(state);
       if (
         this.state.schemaVersion &&
         response.schema_version !== this.state.schemaVersion
@@ -569,6 +727,7 @@ export class SyncStore {
         return;
       }
       for (const event of response.events) this.applyEvent(event);
+      if (this.state.cursor !== response.cursor || this.state.schemaVersion !== response.schema_version) this.touch();
       this.state.cursor = response.cursor;
       this.state.schemaVersion = response.schema_version;
       if (!response.has_more) break;
@@ -582,15 +741,19 @@ export class SyncStore {
       return;
     }
     this.phase = "syncing";
+    const state = this.state;
     this.lastError = undefined;
     this.notify();
     try {
       if (!this.state.schemaVersion) await this.bootstrapInternal();
+      this.assertCurrent(state);
       const flushed = await this.flushPending();
+      this.assertCurrent(state);
       if (flushed && this.state.conflicts.length === 0) {
         try {
           await this.pullAll();
         } catch (error) {
+          this.assertCurrent(state);
           if ((error as { code?: string })?.code === "reset_required") {
             await this.bootstrapInternal();
             this.applyOptimisticPending();
@@ -600,41 +763,56 @@ export class SyncStore {
         }
       }
       await this.persist();
-      this.phase = this.state.conflicts.length ? "conflict" : "idle";
+      this.assertCurrent(state);
+      this.phase = this.state.conflicts.length ? "conflict" : this.lastError ? "error" : "idle";
+      this.failures = this.lastError ? this.failures + 1 : 0;
     } catch (error) {
+      if (this.closed || state !== this.state) return;
+      this.failures++;
       this.phase = "error";
       this.lastError = error instanceof Error ? error.message : String(error);
     }
-    this.notify();
+    if (!this.online) this.phase = "offline";
+    this.notify(true);
   }
 
   private installLiveInvalidation() {
+    const updateHealth = () => {
+      const next: SyncStoreStatus["realtime"] = this.options.live === false ? "disabled"
+        : this.client.realtimeStatus === "live" && this.options.resources.every((resource) => this.readyResources.has(resource)) ? "live" : "degraded";
+      if (next === this.realtime) return;
+      this.realtime = next;
+      this.notify();
+      if (next === "live") void this.requestSync(false, true);
+      else this.schedulePoll();
+    };
     if (this.options.live !== false) {
+      this.stopRealtime = this.client.onRealtimeStatus(updateHealth);
+      this.stopSubscriptions = this.client.onSubscriptionStatus((statuses) => {
+        this.readyResources = new Set(statuses.filter((status) => status.status === "ready" && status.rowId === undefined).map((status) => status.table));
+        updateHealth();
+      });
       for (const resource of this.options.resources) {
         try {
-          const stop = this.client.from(resource).subscribe(() => {
-            if (this.online) void this.sync();
-          });
+          const stop = this.client.from(resource).subscribe(() => this.invalidate());
           this.liveStops.push(stop);
         } catch {
           // REST-only runtimes can use explicit sync() or pollIntervalMs.
         }
       }
     }
-    const interval = this.options.pollIntervalMs ?? 0;
-    if (interval > 0) {
-      this.pollTimer = setInterval(() => {
-        if (this.online) void this.sync();
-      }, interval);
-    }
+    updateHealth();
+    this.schedulePoll();
   }
 
   close() {
     if (this.closed) return;
     this.closed = true;
+    this.stopRealtime?.();
+    this.stopSubscriptions?.();
     for (const stop of this.liveStops) stop();
     this.liveStops = [];
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.clearTimers();
     this.stopAuthScope?.();
     this.listeners.clear();
   }

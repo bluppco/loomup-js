@@ -34,6 +34,8 @@ export type CreateClientOptions = {
    * server version that does not yet support application heartbeat pongs.
    */
   realtimeHeartbeat?: RealtimeHeartbeatOptions | false;
+  /** REST row catch-up after reconnect. Disable when a SyncStore owns cursor recovery. Default true. */
+  realtimeResync?: boolean;
 };
 
 export type RealtimeHeartbeatOptions = {
@@ -48,6 +50,13 @@ export type RealtimeStatus =
   | "live"
   | "stale"
   | "reconnecting";
+
+export type SubscriptionStatus = {
+  table: string;
+  rowId?: string;
+  status: "pending" | "ready" | "error";
+  error?: string;
+};
 
 /** Minimal session shape for setSession (user/expires optional). */
 export type SessionTokens = {
@@ -612,7 +621,16 @@ export class LoomupClient<
   private pendingSubscribeByKey = new Map<string, { requestId: string; promise: Promise<void> }>();
   private queuedSubscribeRequestIds = new Map<string, string>();
   private subscribeRequestKeys = new Map<string, string>();
+  private subscriptionSequence = 0;
   private acknowledgedSubscriptions = new Set<string>();
+  private subscriptionStates = new Map<string, SubscriptionStatus & {
+    requestId?: string;
+    timer?: ReturnType<typeof setTimeout>;
+    retryTimer?: ReturnType<typeof setTimeout>;
+    attempt: number;
+  }>();
+  private subscriptionStatusHandlers = new Set<(statuses: readonly SubscriptionStatus[]) => void>();
+  private readonly realtimeResync: boolean;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private intentionalClose = false;
   private refreshing: Promise<AuthTokens> | null = null;
@@ -648,6 +666,7 @@ export class LoomupClient<
   private readonly onTokens?: (tokens: AuthTokens | null) => void;
   private readonly accessTokenProvider?: () => Promise<string | undefined>;
   private externalRefresh: Promise<string | undefined> | null = null;
+  private tokenRevision = 0;
   private authScopeValue: string;
   private authScopeHandlers = new Set<(scope: string) => void>();
   /** Ms a socket must stay open before backoff counter resets. */
@@ -660,6 +679,7 @@ export class LoomupClient<
     this.publishableKey = options.publishableKey;
     this.serviceKey = options.serviceKey;
     this.wsImplOption = options.WebSocketImpl;
+    this.realtimeResync = options.realtimeResync !== false;
     this.onTokens = options.onTokens;
     this.accessTokenProvider = options.accessTokenProvider;
     this.authScopeValue = tokenSubject(options.token) ?? "anonymous";
@@ -704,7 +724,48 @@ export class LoomupClient<
     return () => this.realtimeStatusHandlers.delete(handler);
   }
 
+  /** Observe acknowledged subscriptions, including their initial snapshot and later failures. */
+  onSubscriptionStatus(handler: (statuses: readonly SubscriptionStatus[]) => void): () => void {
+    this.subscriptionStatusHandlers.add(handler);
+    handler(this.subscriptionSnapshot());
+    return () => this.subscriptionStatusHandlers.delete(handler);
+  }
+
+  private subscriptionSnapshot(): SubscriptionStatus[] {
+    return [...this.subscriptionStates.values()].map(({ table, rowId, status, error }) => ({
+      table, ...(rowId === undefined ? {} : { rowId }), status,
+      ...(error === undefined ? {} : { error }),
+    }));
+  }
+
+  private notifySubscriptionStatus() {
+    const snapshot = this.subscriptionSnapshot();
+    for (const handler of this.subscriptionStatusHandlers) {
+      try { handler(snapshot); } catch { /* observers cannot break the socket */ }
+    }
+  }
+
+  private failSubscription(key: string, error: string) {
+    const state = this.subscriptionStates.get(key);
+    if (!state || !this.subs.has(key)) return;
+    clearTimeout(state.timer);
+    state.timer = undefined;
+    this.acknowledgedSubscriptions.delete(key);
+    state.status = "error";
+    state.error = error;
+    this.notifySubscriptionStatus();
+    if (state.retryTimer || this.intentionalClose || this.ws?.readyState !== 1) return;
+    const delay = Math.min(30_000, 2_000 * 2 ** Math.min(state.attempt++, 4));
+    state.retryTimer = setTimeout(() => {
+      state.retryTimer = undefined;
+      if (this.subscriptionStates.get(key) === state && this.subs.has(key) && this.ws?.readyState === 1) {
+        this.sendSubscribe(state.table, state.rowId);
+      }
+    }, delay);
+  }
+
   setToken(token: string | undefined) {
+    this.tokenRevision++;
     const prev = this.token;
     this.token = token;
     this.setAuthScope(tokenSubject(token) ?? "anonymous");
@@ -720,6 +781,19 @@ export class LoomupClient<
 
   setRefreshToken(token: string | undefined) {
     this.refreshToken = token;
+  }
+
+  private refreshExternalToken(): Promise<string | undefined> {
+    if (!this.externalRefresh) {
+      const revision = this.tokenRevision;
+      this.externalRefresh = Promise.resolve().then(() => this.accessTokenProvider!()).then((token) => {
+        // Framework providers may already have installed the token. Apply it
+        // once for the shared REST/storage recovery, not once per waiting request.
+        if (token && (revision === this.tokenRevision || token !== this.token)) this.setToken(token);
+        return token;
+      }).finally(() => { this.externalRefresh = null; });
+    }
+    return this.externalRefresh;
   }
 
   /**
@@ -903,14 +977,8 @@ export class LoomupClient<
       this.accessTokenProvider &&
       !path.startsWith("/auth/")
     ) {
-      if (!this.externalRefresh) {
-        this.externalRefresh = this.accessTokenProvider().finally(() => {
-          this.externalRefresh = null;
-        });
-      }
-      const nextToken = await this.externalRefresh;
+      const nextToken = await this.refreshExternalToken();
       if (nextToken) {
-        this.setToken(nextToken);
         return this.requestStorage(method, path, { ...opts, skipRetry: true });
       }
     }
@@ -1133,14 +1201,8 @@ export class LoomupClient<
       this.accessTokenProvider &&
       !path.startsWith("/auth/")
     ) {
-      if (!this.externalRefresh) {
-        this.externalRefresh = this.accessTokenProvider().finally(() => {
-          this.externalRefresh = null;
-        });
-      }
-      const nextToken = await this.externalRefresh;
+      const nextToken = await this.refreshExternalToken();
       if (nextToken) {
-        this.setToken(nextToken);
         return this.request<T>(method, path, body, { ...opts, skipRetry: true });
       }
     }
@@ -1360,6 +1422,7 @@ export class LoomupClient<
   }
 
   private applyTokens(data: AuthTokens) {
+    this.tokenRevision++;
     this.token = data.access_token;
     this.refreshToken = data.refresh_token;
     this.setAuthScope(data.user?.id ?? tokenSubject(data.access_token) ?? "anonymous");
@@ -1495,9 +1558,17 @@ export class LoomupClient<
 
   private prepareSubscriptionsForReplacement() {
     this.acknowledgedSubscriptions.clear();
-    for (const [key, pending] of this.pendingSubscribeByKey) {
-      this.queuedSubscribeRequestIds.set(key, pending.requestId);
+    this.subscribeRequestKeys.clear();
+    this.queuedSubscribeRequestIds.clear();
+    for (const state of this.subscriptionStates.values()) {
+      clearTimeout(state.timer);
+      clearTimeout(state.retryTimer);
+      state.timer = state.retryTimer = undefined;
+      state.requestId = undefined;
+      state.status = "pending";
+      state.error = undefined;
     }
+    this.notifySubscriptionStatus();
   }
 
   private retireSocket(ws: WebSocket, generation: number, reconnect: boolean) {
@@ -1593,8 +1664,8 @@ export class LoomupClient<
     }
     for (const key of this.subs.keys()) {
       this.acknowledgedSubscriptions.delete(key);
-      const pending = this.pendingSubscribeByKey.get(key);
-      if (pending) this.queuedSubscribeRequestIds.set(key, pending.requestId);
+      // Each authentication epoch gets fresh wire IDs; a late old ack cannot restore health.
+      this.queuedSubscribeRequestIds.delete(key);
       const { table, rowId } = parseSubKey(key);
       this.sendSubscribe(table, rowId);
     }
@@ -1632,8 +1703,10 @@ export class LoomupClient<
     const isFirst = !this.subs.has(key);
     if (isFirst) {
       this.subs.set(key, new Set());
+      this.subscriptionStates.set(key, { table, rowId, status: "pending", attempt: 0 });
     }
     this.subs.get(key)!.add(handler);
+    if (isFirst) this.notifySubscriptionStatus();
     this.attachBrowserLifecycle();
     this.activateHeartbeatForCurrentSocket();
     return { key, isFirst };
@@ -1649,6 +1722,12 @@ export class LoomupClient<
       this.subs.get(key)?.delete(handler);
       if (this.subs.get(key)?.size === 0) {
         this.subs.delete(key);
+        const state = this.subscriptionStates.get(key);
+        clearTimeout(state?.timer);
+        clearTimeout(state?.retryTimer);
+        if (state?.requestId) this.subscribeRequestKeys.delete(state.requestId);
+        this.subscriptionStates.delete(key);
+        this.notifySubscriptionStatus();
         this.acknowledgedSubscriptions.delete(key);
         this.queuedSubscribeRequestIds.delete(key);
         // The socket is owned by the complete subscription set. Closing it
@@ -1703,7 +1782,7 @@ export class LoomupClient<
       if (this.acknowledgedSubscriptions.has(key)) return unsub;
       let pending = this.pendingSubscribeByKey.get(key);
       if (!pending) {
-        const requestId = `sub_${table}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+        const requestId = `sub_${table}_${++this.subscriptionSequence}`;
         const promise = this.waitForSubscribeAck(requestId, key, timeoutMs);
         pending = { requestId, promise };
         this.pendingSubscribeByKey.set(key, pending);
@@ -1759,16 +1838,25 @@ export class LoomupClient<
     const rid = data.requestId;
     if (!rid) return;
     const requestKey = this.subscribeRequestKeys.get(rid);
-    this.subscribeRequestKeys.delete(rid);
-    if (data.type === "subscribed" && requestKey) {
+    const state = requestKey ? this.subscriptionStates.get(requestKey) : undefined;
+    if (!requestKey || !state || state.requestId !== rid) return;
+    if (data.type === "subscribed") {
       this.acknowledgedSubscriptions.add(requestKey);
+      clearTimeout(state.timer);
+      clearTimeout(state.retryTimer);
+      state.timer = state.retryTimer = undefined;
+      state.status = "ready";
+      state.error = undefined;
+      state.attempt = 0;
+      this.notifySubscriptionStatus();
+    } else {
+      this.failSubscription(requestKey, data.message || data.code || "subscribe failed");
     }
-    const pending = this.pendingSubscribeAcks.get(rid);
+    const waiterId = this.pendingSubscribeByKey.get(requestKey)?.requestId;
+    const pending = waiterId ? this.pendingSubscribeAcks.get(waiterId) : undefined;
     if (!pending) return;
-    this.pendingSubscribeAcks.delete(rid);
-    if (this.pendingSubscribeByKey.get(pending.key)?.requestId === rid) {
-      this.pendingSubscribeByKey.delete(pending.key);
-    }
+    this.pendingSubscribeAcks.delete(waiterId!);
+    this.pendingSubscribeByKey.delete(pending.key);
     if (data.type === "subscribed") {
       this.acknowledgedSubscriptions.add(pending.key);
       pending.resolve();
@@ -1835,7 +1923,7 @@ export class LoomupClient<
       // CDC processed without client delivery during the outage).
       const isReconnect = this.hasOpenedOnce;
       this.hasOpenedOnce = true;
-      if (isReconnect && this.subs.size > 0) {
+      if (isReconnect && this.subs.size > 0 && this.realtimeResync) {
         void this.resyncSubscriptions();
       }
     };
@@ -1858,6 +1946,14 @@ export class LoomupClient<
         // Resolve subscribeReady waiters before fan-out to control handlers.
         if (data.type === "subscribed" || data.type === "error") {
           this.resolveSubscribeAck(data as ControlEvent);
+        }
+        if (data.type === "error" && !data.requestId) {
+          const control = data as ControlEvent;
+          for (const [key, state] of this.subscriptionStates) {
+            if (control.code === "AUTH_ERROR" || (control.code === "SUBSCRIBE_ERROR" && control.table === state.table)) {
+              this.failSubscription(key, control.message || control.code!);
+            }
+          }
         }
         // Surface auth/subscribe control responses.
         this.controlHandlers.forEach((h) => h(data as ControlEvent));
@@ -1999,9 +2095,26 @@ export class LoomupClient<
   private sendSubscribe(table: string, rowId?: string): string {
     const key = makeSubKey(table, rowId);
     const requestId = this.queuedSubscribeRequestIds.get(key)
-      ?? `sub_${table}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      ?? `sub_${table}_${++this.subscriptionSequence}`;
     this.queuedSubscribeRequestIds.delete(key);
+    const state = this.subscriptionStates.get(key);
+    if (state) {
+      clearTimeout(state.timer);
+      clearTimeout(state.retryTimer);
+      state.retryTimer = undefined;
+      if (state.requestId) this.subscribeRequestKeys.delete(state.requestId);
+      state.requestId = requestId;
+      state.status = "pending";
+      state.error = undefined;
+      this.acknowledgedSubscriptions.delete(key);
+      state.timer = setTimeout(() => {
+        if (this.subscriptionStates.get(key)?.requestId === requestId) {
+          this.failSubscription(key, "subscribe acknowledgement timeout");
+        }
+      }, 5_000);
+    }
     this.subscribeRequestKeys.set(requestId, key);
+    this.notifySubscriptionStatus();
     this.send({
       type: "subscribe",
       table,
@@ -2069,6 +2182,12 @@ export class LoomupClient<
       this.wsGeneration += 1;
     }
     this.subs.clear();
+    for (const state of this.subscriptionStates.values()) {
+      clearTimeout(state.timer);
+      clearTimeout(state.retryTimer);
+    }
+    this.subscriptionStates.clear();
+    this.notifySubscriptionStatus();
     this.acknowledgedSubscriptions.clear();
     this.queuedSubscribeRequestIds.clear();
     this.subscribeRequestKeys.clear();

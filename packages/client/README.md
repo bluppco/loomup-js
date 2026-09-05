@@ -99,6 +99,18 @@ the existing REST resync. Late events from the retired socket are ignored.
 
 `client.realtimeStatus` reports `connecting`, `live`, `stale`, or
 `reconnecting`; `client.onRealtimeStatus(handler)` can observe transitions.
+
+Transport liveness does not imply that subscriptions have been acknowledged.
+`client.onSubscriptionStatus(handler)` immediately supplies the current array of
+`{ table, rowId?, status: "pending" | "ready" | "error", error? }` entries and
+subsequent changes. Acknowledgments are correlated to the current subscription
+attempt; failed or timed-out subscriptions retain their listeners and retry with
+2–30 second exponential backoff. Reauthentication invalidates previous readiness.
+
+When a `SyncStore` owns recovery, create its client with `realtimeResync: false`.
+The store catches up through the durable cursor after subscription recovery,
+including missed deletions. The default remains `true` for clients that depend on
+legacy REST row-resync events after reconnect.
 Most applications do not need either. Timing can be adjusted for tests or
 proxy-specific deployments:
 

@@ -25,6 +25,8 @@ export type OfflineClientOptions = {
   online?: boolean;
   live?: boolean;
   pollIntervalMs?: number;
+  reconcileIntervalMs?: number;
+  liveDebounceMs?: number;
   /** Follow browser online/offline events. Default true. */
   autoConnectivity?: boolean;
 };
@@ -89,6 +91,7 @@ export class OfflineClient {
   }
 
   setOnline(online: boolean) { return this.store.setOnline(online); }
+  setActive(active: boolean) { return this.store.setActive(active); }
   sync() { return this.store.sync(); }
   resolveConflict(id: string, resolution: "discard" | "retry", data?: Record<string, unknown>) {
     return this.store.resolveConflict(id, resolution, data);
@@ -124,6 +127,8 @@ export async function createOfflineClient(options: OfflineClientOptions): Promis
     // A transient network/CORS/server interruption should reconcile without
     // requiring every application to remember to configure a retry loop.
     pollIntervalMs: options.pollIntervalMs ?? 5_000,
+    reconcileIntervalMs: options.reconcileIntervalMs,
+    liveDebounceMs: options.liveDebounceMs,
   });
   const offline = new OfflineClient(store, client, storage, ownsClient);
 

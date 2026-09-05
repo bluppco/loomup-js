@@ -30,6 +30,9 @@ describe("createOfflineClient", () => {
       );
       assert.equal(notes.get("note-1")?.title, "draft");
       assert.equal(offline.status.pending, 1);
+      assert.equal(offline.status.dataRevision, 1);
+      assert.equal(offline.status.resourceRevisions.notes, 1);
+      await offline.setActive(false);
 
       await notes.update(
         "note-1",
@@ -42,6 +45,7 @@ describe("createOfflineClient", () => {
       await notes.remove("note-1", { mutationId: "device:3" });
       assert.equal(notes.get("note-1"), undefined);
       assert.equal(offline.status.pending, 3);
+      assert.equal(offline.status.dataRevision, 3);
     } finally {
       offline.close();
       client.closeRealtime();
