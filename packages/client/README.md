@@ -97,6 +97,15 @@ pong. If an apparently open socket stops carrying application data, the client
 retires it, reconnects with jitter, reauthenticates, resubscribes, and performs
 the existing REST resync. Late events from the retired socket are ignored.
 
+In browsers, an `offline` event retires the socket and pauses reconnect,
+heartbeat, and subscription retry timers while retaining active subscribers.
+New connections are deferred while `navigator.onLine` is `false`. An `online`
+event reconnects immediately instead of waiting for an old backoff timer;
+ordinary connection failures still use exponential backoff with jitter because
+browser connectivity does not guarantee the server is reachable. This works
+with `realtimeHeartbeat: false` too. Runtimes without browser connectivity APIs
+keep their normal retry behavior, and `subscribeReady()` retains its timeout.
+
 `client.realtimeStatus` reports `connecting`, `live`, `stale`, or
 `reconnecting`; `client.onRealtimeStatus(handler)` can observe transitions.
 

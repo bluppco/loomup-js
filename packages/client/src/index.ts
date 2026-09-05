@@ -661,6 +661,7 @@ export class LoomupClient<
   private ws?: WebSocket;
   /** Monotonic socket identity; retired-socket events are ignored. */
   private wsGeneration = 0;
+  private wsStartedAt = 0;
   private subs = new Map<string, Set<SubscribeHandler>>();
   private controlHandlers = new Set<ControlHandler>();
   /** Pending subscribe acks keyed by requestId (subscribeReady waits on these). */
@@ -710,6 +711,8 @@ export class LoomupClient<
   private realtimeStatusValue: RealtimeStatus = "connecting";
   private realtimeStatusHandlers = new Set<(status: RealtimeStatus) => void>();
   private browserLifecycleAttached = false;
+  private readonly runtimeOfflineHandler = () => this.handleRuntimeOffline();
+  private readonly runtimeOnlineHandler = () => this.handleRuntimeResume(true);
   private readonly runtimeResumeHandler = () => this.handleRuntimeResume();
   private readonly visibilityResumeHandler = () => {
     const doc = (globalThis as { document?: Document }).document;
@@ -1677,13 +1680,14 @@ export class LoomupClient<
   }
 
   private attachBrowserLifecycle() {
-    if (this.browserLifecycleAttached || !this.heartbeatEnabled) return;
+    if (this.browserLifecycleAttached) return;
     const runtime = globalThis as unknown as {
       addEventListener?: (type: string, listener: () => void) => void;
     };
     if (typeof runtime.addEventListener === "function") {
       runtime.addEventListener("pageshow", this.runtimeResumeHandler);
-      runtime.addEventListener("online", this.runtimeResumeHandler);
+      runtime.addEventListener("online", this.runtimeOnlineHandler);
+      runtime.addEventListener("offline", this.runtimeOfflineHandler);
       this.browserLifecycleAttached = true;
     }
     const doc = (globalThis as { document?: Document }).document;
@@ -1699,34 +1703,70 @@ export class LoomupClient<
       removeEventListener?: (type: string, listener: () => void) => void;
     };
     runtime.removeEventListener?.("pageshow", this.runtimeResumeHandler);
-    runtime.removeEventListener?.("online", this.runtimeResumeHandler);
+    runtime.removeEventListener?.("online", this.runtimeOnlineHandler);
+    runtime.removeEventListener?.("offline", this.runtimeOfflineHandler);
     const doc = (globalThis as { document?: Document }).document;
     doc?.removeEventListener?.("visibilitychange", this.visibilityResumeHandler);
     this.browserLifecycleAttached = false;
   }
 
-  private handleRuntimeResume() {
-    if (!this.heartbeatEnabled || this.subs.size === 0) return;
+  private isRuntimeOffline(): boolean {
+    const runtime = globalThis as unknown as {
+      navigator?: { onLine?: boolean };
+      addEventListener?: unknown;
+    };
+    // Only pause where an online event can resume us. Node/custom transports
+    // without browser connectivity APIs keep their normal retry behavior.
+    return typeof runtime.addEventListener === "function"
+      && runtime.navigator?.onLine === false;
+  }
+
+  private handleRuntimeOffline() {
+    if (this.intentionalClose) return;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    this.setRealtimeStatus("stale");
+    // Retiring also clears heartbeat, stability and subscription retry timers,
+    // but keeps subscribers (and their finite subscribeReady deadlines).
+    if (this.ws) this.retireSocket(this.ws, this.wsGeneration, false);
+  }
+
+  private handleRuntimeResume(immediate = false) {
+    if (this.intentionalClose || this.subs.size === 0) return;
+    if (this.isRuntimeOffline()) {
+      this.handleRuntimeOffline();
+      return;
+    }
     const ws = this.ws;
     const generation = this.wsGeneration;
+    // online/pageshow/visibilitychange can arrive together. Do not retire a
+    // fresh connection attempt, but still recover a stalled one after sleep.
+    if (ws?.readyState === 0 && (
+      !this.heartbeatEnabled
+      || Date.now() - this.wsStartedAt < this.heartbeatStaleAfterMs
+    )) return;
     if (ws && ws.readyState === 1 && this.isCurrentSocket(ws, generation)) {
+      if (!this.heartbeatEnabled) return;
       if (
         this.lastHeartbeatAt === 0
         || Date.now() - this.lastHeartbeatAt >= this.heartbeatStaleAfterMs
       ) {
         this.setRealtimeStatus("stale");
-        this.retireSocket(ws, generation, true);
+        this.retireSocket(ws, generation, false);
       } else {
-        this.sendHeartbeatProbe(ws, generation);
+        if (!this.pendingHeartbeatRequestId) this.sendHeartbeatProbe(ws, generation);
+        return;
       }
-      return;
     }
     this.setRealtimeStatus("stale");
     if (ws && this.isCurrentSocket(ws, generation)) {
-      this.retireSocket(ws, generation, true);
-    } else {
-      this.scheduleReconnect();
+      this.retireSocket(ws, generation, false);
     }
+    if (this.intentionalClose || this.subs.size === 0) return;
+    // Connectivity returning is a new opportunity, not another failed retry.
+    // ensureWs cancels old backoff; ordinary failures still use bounded jitter.
+    if (immediate) this.ensureWs();
+    else this.scheduleReconnect();
   }
 
   /**
@@ -1958,6 +1998,11 @@ export class LoomupClient<
   private ensureWs() {
     const OPEN = 1;
     const CONNECTING = 0;
+    this.intentionalClose = false;
+    if (this.isRuntimeOffline()) {
+      this.handleRuntimeOffline();
+      return;
+    }
     if (
       this.ws &&
       (this.ws.readyState === OPEN || this.ws.readyState === CONNECTING)
@@ -1966,15 +2011,19 @@ export class LoomupClient<
     }
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
-    this.intentionalClose = false;
     this.setRealtimeStatus(this.hasOpenedOnce ? "reconnecting" : "connecting");
     const Ws = this.getWsCtor();
     const ws = new Ws(this.wsUrl());
     const generation = ++this.wsGeneration;
     let opened = false;
     this.ws = ws;
+    this.wsStartedAt = Date.now();
     ws.onopen = () => {
       if (!this.isCurrentSocket(ws, generation) || opened) return;
+      if (this.isRuntimeOffline()) {
+        this.handleRuntimeOffline();
+        return;
+      }
       opened = true;
       // Reset backoff only after a stable open window so open/close flapping
       // still reaches exponential delays.
@@ -2062,7 +2111,12 @@ export class LoomupClient<
    * Base 1s, doubles each attempt, caps at 30s; delay = random(0, min(cap, base*2^n)).
    */
   private scheduleReconnect() {
-    if (this.intentionalClose || this.subs.size === 0 || this.reconnectTimer) return;
+    if (this.intentionalClose || this.subs.size === 0) return;
+    if (this.isRuntimeOffline()) {
+      this.handleRuntimeOffline();
+      return;
+    }
+    if (this.reconnectTimer) return;
     this.setRealtimeStatus("reconnecting");
     const baseMs = 1000;
     const capMs = 30_000;
