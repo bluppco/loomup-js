@@ -178,6 +178,57 @@ describe("event-driven synchronization", () => {
     assert.equal(state.pulls, 5);
   });
 
+  it("does not extend an explicit refresh with hidden socket invalidations", async (t) => {
+    const { store, socket, state } = await fixture(t);
+    let release!: () => void;
+    state.hold = new Promise((resolve) => { release = resolve; });
+    const running = store.sync();
+    await drain();
+    await store.setActive(false);
+    for (let index = 0; index < 20; index++) socket.change();
+    state.hold = undefined; release();
+    await running;
+    assert.equal(state.pulls, 1, "the explicit cycle finishes without a hidden follow-up");
+    t.mock.timers.tick(900_000); await drain();
+    assert.equal(state.pulls, 1);
+    await store.sync();
+    assert.equal(state.pulls, 2, "another explicit refresh is still allowed");
+    await store.setActive(true);
+    assert.equal(state.pulls, 3, "deferred invalidations catch up once on resume");
+  });
+
+  it("rechecks visibility before a queued automatic cycle starts", async (t) => {
+    const { store, state } = await fixture(t);
+    await store.setActive(false);
+    const activating = store.setActive(true);
+    await store.setActive(false);
+    await activating;
+    assert.equal(state.pulls, 0);
+    await store.setActive(true);
+    assert.equal(state.pulls, 1);
+  });
+
+  it("honors an explicit refresh joining queued automatic work after hiding", async (t) => {
+    const { store, state } = await fixture(t);
+    await store.setActive(false);
+    const activating = store.setActive(true);
+    const hiding = store.setActive(false);
+    const explicit = store.sync();
+    await Promise.all([activating, hiding, explicit]);
+    assert.equal(state.pulls, 1, "the explicit caller upgrades only the queued cycle");
+    t.mock.timers.tick(900_000); await drain();
+    assert.equal(state.pulls, 1, "joining the cycle does not restart hidden polling");
+  });
+
+  it("does not let a just-skipped automatic task swallow a new explicit refresh", async (t) => {
+    const { store, state } = await fixture(t);
+    await store.setActive(false);
+    const activating = store.setActive(true);
+    await store.setActive(false); // Let the queued task observe the hidden state.
+    await Promise.all([activating, store.sync()]);
+    assert.equal(state.pulls, 1);
+  });
+
   it("recovers an empty table after reconnect with one cursor pull and no REST row resync", async (t) => {
     const { store, socket, state } = await fixture(t);
     state.cursor = 2;

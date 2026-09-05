@@ -205,7 +205,7 @@ export class SyncStore {
   private active = true;
   private syncTask?: Promise<void>;
   private followup = false;
-  private forced = false;
+  private explicitSyncRequested = false;
   private eventTimer?: ReturnType<typeof setTimeout>;
   private stopRealtime?: () => void;
   private stopSubscriptions?: () => void;
@@ -497,20 +497,28 @@ export class SyncStore {
     if (this.closed || !this.online) return Promise.resolve();
     if (!force && !this.active) { this.followup = true; return Promise.resolve(); }
     this.clearTimers();
-    this.forced ||= force;
+    this.explicitSyncRequested ||= force;
     if (this.syncTask) {
       this.followup ||= followup;
       return this.syncTask;
     }
     const task = this.run(async () => {
-      do {
-        this.followup = false;
-        await this.syncInternal();
-      } while (this.followup && !this.closed && this.online && (this.active || this.forced) && this.phase !== "error");
-    }).finally(() => {
-      this.syncTask = undefined;
-      this.forced = false;
-      this.schedulePoll();
+      try {
+        // Automatic work can be queued behind a durable write. Recheck the
+        // lifecycle gate when it actually starts, not only when it was requested.
+        if (!this.explicitSyncRequested && !this.active) { this.followup = true; return; }
+        do {
+          this.followup = false;
+          await this.syncInternal();
+          // Explicit sync permits this cycle while hidden, not automatic
+          // follow-ups from socket events received during that cycle.
+        } while (this.followup && !this.closed && this.online && this.active && this.phase !== "error");
+      } finally {
+        // Retire skipped work before another caller can join its settled cycle.
+        this.syncTask = undefined;
+        this.explicitSyncRequested = false;
+        this.schedulePoll();
+      }
     });
     this.syncTask = task;
     return task;

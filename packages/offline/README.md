@@ -52,8 +52,10 @@ HTTP requests within a cycle.
 
 Call `setActive(false)` while hidden and `setActive(true)` after authenticating
 on resume; use `setOnline(false)` offline. Pausing automatic work preserves
-socket heartbeats and explicit `sync()`/mutation behavior. Close the offline
-client on logout or teardown. Browser lifecycle ownership is optional; the
+socket heartbeats and explicit `sync()`/mutation behavior. An explicit hidden
+sync permits one cycle; socket invalidations cannot extend it with hidden
+follow-ups. Queued automatic cycles also recheck the active state before starting.
+Close the offline client on logout or teardown. Browser lifecycle ownership is optional; the
 existing `autoConnectivity` default remains enabled.
 
 Status includes `realtime`, `dataRevision`, and per-table `resourceRevisions`.

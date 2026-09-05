@@ -1,6 +1,6 @@
 {
   "name": "@loomup/offline",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "First-party browser SQLite and offline resource client for Loomup",
   "type": "module",
   "main": "dist/index.js",
@@ -28,7 +28,7 @@
     "@loomup/client": ">=0.1.13"
   },
   "devDependencies": {
-    "@loomup/client": "0.1.13",
+    "@loomup/client": "0.1.14",
     "@types/node": "^22.0.0",
     "@types/sql.js": "^1.4.11",
     "typescript": "^5.7.0"
