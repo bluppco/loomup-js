@@ -243,7 +243,7 @@ function parseSchema(source: string): { tables: ParsedTable[]; realtimeTables: S
       const fields = known.get(tableName);
       if (!fields) throw new Error(`push table \`${tableName}\` is not declared as an exposed schema table`);
       const settings = object(raw, `push table \`${tableName}\``);
-      const allowed = new Set(["recipient_fields", "operations", "title", "body", "notify"]);
+      const allowed = new Set(["recipient_fields", "operations", "title", "body", "data", "notify"]);
       const settingUnknown = Object.keys(settings).find((key) => !allowed.has(key));
       if (settingUnknown) throw new Error(`unknown push table setting \`${settingUnknown}\``);
       const recipients = settings.recipient_fields ?? ["user_id"];
@@ -255,6 +255,27 @@ function parseSchema(source: string): { tables: ParsedTable[]; realtimeTables: S
         throw new Error(`push table \`${tableName}\` operations must contain insert, update, or delete`);
       }
     }
+  }
+  if (root.$notifications !== undefined) {
+    const config = object(root.$notifications, "`$notifications`");
+    const allowed = new Set(["enabled", "table", "recipient_field", "actor_field", "type_field", "event_key_field", "push_title", "push_body", "events", "templates", "presentation_field", "scopes", "fallback"]);
+    for (const key of Object.keys(config)) if (!allowed.has(key)) throw new Error(`unknown notification setting \`${key}\``);
+    const templates = config.templates === undefined ? {} : object(config.templates, "notification templates");
+    for (const [kind, raw] of Object.entries(templates)) {
+      if (!/^[A-Za-z0-9_]+$/.test(kind)) throw new Error(`invalid notification type \`${kind}\``);
+      const template = object(raw, `notification template ${kind}`);
+      for (const key of Object.keys(template)) if (!["label", "title", "body", "url", "data"].includes(key)) throw new Error(`unknown notification template setting \`${key}\``);
+      for (const key of ["label", "title", "body", "url"]) if (template[key] != null && typeof template[key] !== "string") throw new Error(`notification template ${key} must be a string`);
+      if (template.data !== undefined && Object.values(object(template.data, "notification data")).some(value => typeof value !== "string")) throw new Error("notification data values must be strings");
+    }
+    if (config.table) {
+      const table = tables.find(table => table.name === config.table);
+      if (!table) throw new Error("notification inbox table is not declared");
+      if (config.presentation_field) {
+        const field = table.fields.find(field => field.name === config.presentation_field);
+        if (!field || field.token !== "json" || !field.nullable) throw new Error("notification presentation_field must name a nullable json field");
+      }
+    } else if (Array.isArray(config.events) && config.events.length) throw new Error("notification events require an inbox table");
   }
   return { tables, realtimeTables };
 }

@@ -1,6 +1,6 @@
 {
   "name": "@loomup/nuxt",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Nuxt module for Loomup (cookie sessions, server client, Vue composables)",
   "type": "module",
   "main": "dist/module.js",
@@ -42,7 +42,7 @@
     "@nuxt/kit": "^3.15.0"
   },
   "devDependencies": {
-    "@loomup/client": "0.1.14",
+    "@loomup/client": "0.1.15",
     "@types/node": "^22.0.0",
     "h3": "^1.13.0",
     "nuxt": "^3.15.0",

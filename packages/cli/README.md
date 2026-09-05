@@ -218,3 +218,43 @@ the project.
 If the same credential also powers the application backend, choose Studio's
 **Full backend** preset. Its `project:backend` capability includes schema
 deployment and every Resource or operation added to the project later.
+
+## Notification presentation and preferences
+
+Declare application-owned `$notifications.templates` in `loomup.schema.yaml`
+(or `notifications.templates` in a Studio Resource manifest). Use a nullable
+JSON `presentation_field` to save the rendered wording with each inbox row.
+`$push` remains authoritative for recipients and delivery enablement. Run
+`loomup generate` after adding the JSON column, review `loomup migrate --plan`,
+and apply the schema after upgrading the backend.
+
+```ts
+// Trusted application server only: requires a project:backend service key.
+await server.push.send({
+  type: "mention",
+  recipients: [recipientId],
+  idempotency_key: `comment:${commentId}:${recipientId}`,
+  channels: ["inbox", "push"],
+  fields: { actor_id: actorId, actor_name: "Asha", issue_title: "Review design" },
+});
+
+// Signed-in application user; preserve the revision when saving.
+const catalog = await client.push.catalog();
+const preferences = await client.push.preferences.get();
+await client.push.preferences.update({ ...preferences, preview: "hidden" });
+```
+
+`channels` defaults to both; choose only `inbox` or `push` when appropriate.
+Inbox sends need all application-specific required fields. Optional literal
+`content` overrides the declared type's template. Identical idempotent retries
+return the original receipt; reusing a key with changed content returns 409.
+Preference updates also return 409 on stale revisions. Neither recipient mutes
+nor hidden previews change saved inbox content.
+
+Use `readNotificationPresentation(row.presentation)` to read either stored JSON
+or JSON text, and retain an application fallback for historical rows. The server
+uses the same saved snapshot for push. Studio can edit and preview templates and
+inspect per-device delivery diagnostics.
+
+See the [notification guide](https://tryloomup.com/docs/push) for schema examples,
+permissions, payload limits, fallback behavior, and the complete REST contract.

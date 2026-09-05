@@ -1537,3 +1537,42 @@ test("the executable runs when invoked through a package-manager symlink", async
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /loomup migrate/);
 });
+
+test("notification catalogs accept nullable snapshots and string data", () => {
+  const schema = `
+notifications:
+  presentation: json?
+  recipient_id: text
+$notifications:
+  table: notifications
+  presentation_field: presentation
+  templates:
+    mention:
+      label: Mentions
+      title: '{{actor}} mentioned you'
+      body: '{{title}}'
+      url: '/n/{{id}}'
+      data: {type: mention}
+  scopes: {workspace: workspace_id}
+$push:
+  enabled: true
+  tables:
+    notifications:
+      recipient_fields: [recipient_id]
+      operations: [insert]
+      data: {type: mention}
+`;
+  assert.match(generateClientSource(schema), /presentation/);
+  assert.throws(() => generateClientSource(schema.replace("presentation: json?", "presentation: text?")), /nullable json/);
+  assert.throws(() => generateClientSource(schema.replace("data: {type: mention}", "data: {type: 3}")), /string/);
+  assert.throws(() => generateClientSource(schema.replace("label: Mentions", "unrecognized: true")), /unknown notification template setting/);
+  assert.match(generateClientSource(`messages:
+  title: text
+$notifications:
+  templates:
+    alert: {title: Hello, body: World}
+$push:
+  enabled: true
+  tables: {}
+`), /Messages/);
+});

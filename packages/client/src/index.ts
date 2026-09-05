@@ -173,6 +173,61 @@ export type PushDevice = {
 
 export type WebPushConfig = { public_key: string };
 
+export type NotificationContent = {
+  title: string;
+  body: string;
+  url?: string | null;
+  data?: Record<string, string>;
+};
+
+/** Saved at creation; editing a template does not rewrite historical content. */
+export type NotificationPresentation = NotificationContent & {
+  version: 1;
+  template_revision: string;
+  diagnostic?: string | null;
+};
+
+/** Read a versioned presentation from a nullable JSON column or legacy JSON text. */
+export function readNotificationPresentation(value: unknown): NotificationPresentation | null {
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return null; }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result = value as Record<string, unknown>;
+  if (result.version !== 1 || typeof result.title !== "string" || typeof result.body !== "string" || typeof result.template_revision !== "string") return null;
+  if (result.url != null && typeof result.url !== "string") return null;
+  if (result.data != null && (typeof result.data !== "object" || Array.isArray(result.data) || Object.values(result.data).some(value => typeof value !== "string"))) return null;
+  return result as NotificationPresentation;
+}
+
+export type NotificationScope = { kind: string; id: string };
+export type NotificationPreferences = {
+  enabled: boolean;
+  preview: "full" | "hidden";
+  types: Record<string, boolean>;
+  muted_scopes: NotificationScope[];
+  /** Send the revision returned by get(); stale updates return 409. */
+  revision: number;
+};
+export type NotificationCatalog = {
+  types: Array<{ id: string; label: string }>;
+  scopes: string[];
+};
+export type SendNotificationInput = {
+  type: string;
+  recipients: string[];
+  idempotency_key: string;
+  /** Defaults to inbox and push. Push-only sends use ["push"]. */
+  channels?: Array<"inbox" | "push">;
+  fields?: Record<string, unknown>;
+  content?: NotificationContent;
+};
+export type SendNotificationResult = {
+  dispatch_id: string;
+  notification_ids: string[];
+  accepted: number;
+};
+
 export type ListMeta = {
   limit: number;
   offset: number;
@@ -874,6 +929,13 @@ export class LoomupClient<
         this.unregisterPushDevice(idOrToken),
       listDevices: () => this.listPushDevices(),
       webConfig: () => this.webPushConfig(),
+      /** Trusted server operation; requires a project:backend serviceKey. */
+      send: (input: SendNotificationInput) => this.sendNotification(input),
+      catalog: () => this.notificationCatalog(),
+      preferences: {
+        get: () => this.getNotificationPreferences(),
+        update: (preferences: NotificationPreferences) => this.updateNotificationPreferences(preferences),
+      },
     };
   }
 
@@ -1012,6 +1074,23 @@ export class LoomupClient<
   async registerPushDevice(body: RegisterDeviceInput): Promise<PushDevice> {
     const res = await this.request<{ data: PushDevice }>("POST", "/push/devices", body);
     return res.data;
+  }
+
+  async sendNotification(input: SendNotificationInput): Promise<SendNotificationResult> {
+    const response = await this.request<{ data: SendNotificationResult }>("POST", "/push/notifications", input);
+    return response.data;
+  }
+
+  async notificationCatalog(): Promise<NotificationCatalog> {
+    return (await this.request<{ data: NotificationCatalog }>("GET", "/push/catalog")).data;
+  }
+
+  async getNotificationPreferences(): Promise<NotificationPreferences> {
+    return (await this.request<{ data: NotificationPreferences }>("GET", "/push/preferences")).data;
+  }
+
+  async updateNotificationPreferences(preferences: NotificationPreferences): Promise<NotificationPreferences> {
+    return (await this.request<{ data: NotificationPreferences }>("PUT", "/push/preferences", preferences)).data;
   }
 
   async listPushDevices(): Promise<PushDevice[]> {
