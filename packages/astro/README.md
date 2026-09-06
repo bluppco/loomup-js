@@ -52,6 +52,13 @@ Package exports:
 - `@loomup/astro/middleware` — authentication middleware.
 - `@loomup/astro/auth` — lower-level cookie authentication helpers.
 
+The server client accepts both JSON token responses and Loomup `cookie_mode`
+responses, where the rotated refresh credential is supplied only in an upstream
+`Set-Cookie` header. It writes both credentials to application-owned HttpOnly
+cookies before updating the session. An incomplete token exchange throws
+`LoomupError` with code `invalid_response` and status `502`, leaving the existing
+session unchanged. Call server auth methods before response headers are sent.
+
 ## Coordinated browser sessions
 
 `createAuthenticatedProject()` coordinates cookie refresh within a tab and

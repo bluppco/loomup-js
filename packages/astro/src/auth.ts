@@ -2,6 +2,7 @@
 
 import { LoomupError, type OAuthProvider, type User } from "@loomup/client";
 import { readTokens, writeTokens } from "./cookies.js";
+import { normalizeAuthTokens } from "./authTokens.js";
 import {
   createServerClient,
   resolveServerUrl,
@@ -72,30 +73,8 @@ type AuthPayload = {
   user?: User;
 };
 
-type SetCookieHeaders = Headers & {
-  getSetCookie?: () => string[];
-  getAll?: (name: string) => string[];
-};
-
 function joinUrl(base: string, path: string): string {
   return `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
-}
-
-function upstreamCookie(headers: Headers, name: string): string | undefined {
-  const extended = headers as SetCookieHeaders;
-  const values =
-    typeof extended.getSetCookie === "function"
-      ? extended.getSetCookie()
-      : typeof extended.getAll === "function"
-        ? extended.getAll("Set-Cookie")
-        : [headers.get("Set-Cookie") ?? ""];
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`(?:^|,\\s*)${escaped}=([^;]*)`);
-  for (const value of values) {
-    const match = pattern.exec(value);
-    if (match?.[1]) return match[1].replace(/^"|"$/g, "");
-  }
-  return undefined;
 }
 
 async function upstreamRequest<T>(
@@ -136,7 +115,7 @@ async function upstreamRequest<T>(
       upstream.status,
     );
   }
-  if (!envelope || !("data" in envelope)) {
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope) || !("data" in envelope)) {
     throw new LoomupError("invalid response from Loomup", "invalid_response", 502);
   }
   return { data: envelope.data as T, response: upstream };
@@ -148,7 +127,6 @@ async function authExchange(
   options: LoomupAuthHandlerOptions,
   path: string,
   body: unknown,
-  currentRefresh?: string,
 ): Promise<{ accessToken: string; user?: User }> {
   const { data, response: upstream } = await upstreamRequest<AuthPayload>(
     baseUrl,
@@ -158,31 +136,17 @@ async function authExchange(
     undefined,
     options.client?.serviceKey,
   );
-  const accessToken =
-    typeof data.access_token === "string"
-      ? data.access_token
-      : upstreamCookie(upstream.headers, "loomup_access");
-  const refreshToken =
-    typeof data.refresh_token === "string"
-      ? data.refresh_token
-      : upstreamCookie(upstream.headers, "loomup_refresh") ?? currentRefresh;
-  if (!accessToken || !refreshToken) {
-    throw new LoomupError(
-      "Loomup auth response did not include a complete session",
-      "invalid_response",
-      502,
-    );
-  }
+  const tokens = normalizeAuthTokens(data, upstream.headers);
   writeTokens(
     cookies,
     {
-      access_token: accessToken,
-      refresh_token: refreshToken,
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
       expires_in: typeof data.expires_in === "number" ? data.expires_in : undefined,
     },
     options.cookies,
   );
-  return { accessToken, user: data.user };
+  return { accessToken: tokens.access_token, user: data.user };
 }
 
 async function userForAccess(baseUrl: string, accessToken: string): Promise<User> {
@@ -218,7 +182,6 @@ async function sessionFromCookies(
     options,
     "/auth/refresh",
     { refresh_token: tokens.refresh },
-    tokens.refresh,
   );
   return {
     accessToken: session.accessToken,
@@ -286,7 +249,6 @@ async function proxyToLoomup(
       options,
       "/auth/refresh",
       { refresh_token: tokens.refresh },
-      tokens.refresh,
     );
     tokens = readTokens(context.cookies, options.cookies?.names);
   }
@@ -418,7 +380,6 @@ export function createLoomupAuthHandler(options: LoomupAuthHandlerOptions = {}) 
             options,
             "/auth/refresh",
             { refresh_token: refreshToken },
-            refreshToken,
           );
           const user = session.user ?? (await userForAccess(url, session.accessToken));
           return response(publicSession(user));

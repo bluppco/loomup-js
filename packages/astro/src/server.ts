@@ -7,7 +7,6 @@ import {
   LoomupClient,
   projectFromClient,
   type AuthTokens,
-  type AuthSignUpResult,
   type CreateClientOptions,
   type DefaultTableMap,
   type LoomupProject,
@@ -23,6 +22,16 @@ import {
   type CookieOptions,
   type CookieStore,
 } from "./cookies.js";
+import { normalizeAuthTokens } from "./authTokens.js";
+
+const TOKEN_EXCHANGE_PATHS = new Set([
+  "/auth/register",
+  "/auth/login",
+  "/auth/refresh",
+  "/auth/oauth/exchange",
+  "/auth/email-verification/confirm",
+  "/auth/invitations/accept",
+]);
 
 export type {
   CookieNames,
@@ -126,44 +135,37 @@ export class ServerLoomupClient<
     this.mirroredRefresh = options.refreshToken;
   }
 
-  private persistFromTokens(data: AuthTokens) {
+  protected override applyTokens(data: AuthTokens) {
+    // Validate and persist before changing core state or notifying observers.
+    writeTokens(this.cookieStore, {
+      ...data,
+      // Core setSession uses zero when the caller has no expiry metadata.
+      expires_in: data.expires_in === 0 ? undefined : data.expires_in,
+    }, this.cookieOptions);
     this.mirroredRefresh = data.refresh_token;
-    writeTokens(this.cookieStore, data, this.cookieOptions);
+    super.applyTokens(data);
+  }
+
+  protected override normalizeResponse(
+    method: string,
+    path: string,
+    payload: unknown,
+    response: Response,
+  ): unknown {
+    if (method.toUpperCase() !== "POST" || !TOKEN_EXCHANGE_PATHS.has(path)) return payload;
+    const envelope = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : {};
+    const data = envelope.data;
+    if (path === "/auth/register" && data && typeof data === "object"
+      && "verification_required" in data && data.verification_required === true
+      && !("access_token" in data)) return payload;
+    return { ...envelope, data: normalizeAuthTokens(data, response.headers) };
   }
 
   private clearCookieTokens() {
     this.mirroredRefresh = undefined;
     clearTokens(this.cookieStore, this.cookieOptions);
-  }
-
-  override async signUp(creds: {
-    email: string;
-    password: string;
-  }): Promise<AuthSignUpResult> {
-    const data = await super.signUp(creds);
-    if ("access_token" in data) this.persistFromTokens(data);
-    return data;
-  }
-
-  override async signIn(creds: {
-    email: string;
-    password: string;
-  }): Promise<AuthTokens> {
-    const data = await super.signIn(creds);
-    this.persistFromTokens(data);
-    return data;
-  }
-
-  override async refresh(): Promise<AuthTokens> {
-    const data = await super.refresh();
-    this.persistFromTokens(data);
-    return data;
-  }
-
-  override async exchangeOAuthCode(input: OAuthExchangeInput): Promise<AuthTokens> {
-    const data = await super.exchangeOAuthCode(input);
-    this.persistFromTokens(data);
-    return data;
   }
 
   override async signOut(): Promise<void> {

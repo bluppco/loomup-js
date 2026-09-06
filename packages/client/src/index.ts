@@ -1293,7 +1293,17 @@ export class LoomupClient<
         json?.error?.message || json?.message || text || res.statusText;
       throw new LoomupError(String(msg), json?.error?.code, res.status);
     }
-    return json as T;
+    return this.normalizeResponse(method, path, json, res) as T;
+  }
+
+  /** Normalize a successful response before auth methods apply its tokens. */
+  protected normalizeResponse(
+    _method: string,
+    _path: string,
+    payload: unknown,
+    _response: Response,
+  ): unknown {
+    return payload;
   }
 
   /** Authorization-scoped sync snapshot. Cursor is safe to pull after. */
@@ -1503,7 +1513,8 @@ export class LoomupClient<
     }
   }
 
-  private applyTokens(data: AuthTokens) {
+  /** Framework adapters may persist tokens here; persistence errors propagate. */
+  protected applyTokens(data: AuthTokens) {
     this.tokenRevision++;
     this.token = data.access_token;
     this.refreshToken = data.refresh_token;
