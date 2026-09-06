@@ -1,6 +1,7 @@
 /**
  * Cookie helpers for Loomup auth tokens in Astro SSR.
  */
+import { assertSessionTokens } from "./authTokens.js";
 
 export const DEFAULT_ACCESS_COOKIE = "loomup-access";
 export const DEFAULT_REFRESH_COOKIE = "loomup-refresh";
@@ -85,6 +86,7 @@ export function writeTokens(
   },
   options?: CookieOptions,
 ): void {
+  assertSessionTokens(tokens);
   const n = resolveCookieNames(options?.names);
   const path = options?.path ?? "/";
   const secure = isSecureDefault(options?.secure);
