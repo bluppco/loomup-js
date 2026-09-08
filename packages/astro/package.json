@@ -1,6 +1,6 @@
 {
   "name": "@loomup/astro",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Astro integration and SSR helpers for Loomup Realtime",
   "type": "module",
   "main": "dist/index.js",
@@ -37,7 +37,7 @@
     "prepack": "npm run build"
   },
   "peerDependencies": {
-    "@loomup/client": "^0.1.17",
+    "@loomup/client": "^0.1.18",
     "astro": ">=4.0.0"
   },
   "peerDependenciesMeta": {

@@ -184,3 +184,15 @@ inspect per-device delivery diagnostics.
 
 See the [notification guide](https://tryloomup.com/docs/push) for schema examples,
 permissions, payload limits, fallback behavior, and the complete REST contract.
+## CDN storage downloads
+
+`client.storage.from(bucket).createSignedUrl(path, expiresIn)` automatically
+requests CDN delivery when the server supports it. Its public return type stays
+`{url, expires_at}`; the client accepts both absolute HTTPS CDN URLs and relative
+server URLs. Older servers remain compatible.
+
+`download()`, `downloadResponse()`, and existing public URLs follow the server's
+temporary redirect when hosted CDN delivery is enabled. New CDN links are
+revocable: each request rechecks issuer access and object existence. Keep session
+and service credentials on the API origin; the signed URL itself grants download
+access. Upload and metadata APIs are unchanged.

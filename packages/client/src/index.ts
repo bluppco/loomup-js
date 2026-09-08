@@ -3059,12 +3059,14 @@ export class StorageBucket {
   async createSignedUrl(path: string, expiresIn = 900): Promise<SignedStorageUrl> {
     const endpoint = `/storage/v1/${encodeURIComponent(this.bucket)}/sign/${encodeObjectPath(path)}`;
     const response = (await this.client.requestStorage("POST", endpoint, {
-      body: JSON.stringify({ expires_in: expiresIn }),
+      body: JSON.stringify({ expires_in: expiresIn, delivery: "cdn" }),
       headers: { "Content-Type": "application/json" },
     })) as { data: SignedStorageUrl };
     return {
       ...response.data,
-      url: joinUrl(this.client.url, response.data.url),
+      url: /^https:\/\//i.test(response.data.url)
+        ? response.data.url
+        : joinUrl(this.client.url, response.data.url),
     };
   }
 

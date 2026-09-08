@@ -47,6 +47,51 @@ function object(value: unknown, context: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function validateNotificationEvents(events: unknown, tables: ParsedTable[]) {
+  if (events === undefined) return;
+  if (!Array.isArray(events)) throw new Error("notification events must be a list");
+  const scalar = (value: unknown) => ["string", "number", "boolean"].includes(typeof value);
+  const fieldPath = (source: ParsedTable, path: string) => {
+    const parts = path.split(".");
+    let table = source;
+    for (const [index, name] of parts.entries()) {
+      const field = table.fields.find(field => field.name === name);
+      if (!field) throw new Error(`unknown notification condition field ${path}`);
+      if (index < parts.length - 1) {
+        const target = tables.find(table => table.name === field.token);
+        if (!target) throw new Error(`notification condition cannot traverse ${path}`);
+        table = target;
+      }
+    }
+  };
+  for (const raw of events) {
+    const event = object(raw, "notification event");
+    const source = tables.find(table => table.name === event.source);
+    if (!source) throw new Error("notification source is not declared");
+    if ((event.recipient !== undefined) === (event.recipients !== undefined)) {
+      throw new Error("notification event requires exactly one of recipient or recipients");
+    }
+    const recipients = event.recipients === undefined ? [event.recipient] : event.recipients;
+    if (!Array.isArray(recipients) || !recipients.length || recipients.some(field =>
+      typeof field !== "string" || !source.fields.some(candidate => candidate.name === field))) {
+      throw new Error("notification recipients must name declared source fields");
+    }
+    for (const [path, rawCondition] of Object.entries(object(event.when === undefined ? {} : event.when, "notification when"))) {
+      fieldPath(source, path);
+      const condition = object(rawCondition, `notification condition ${path}`);
+      const keys = Object.keys(condition);
+      if (keys.length !== 1 || !["eq", "in", "is_null"].includes(keys[0]!)) {
+        throw new Error("notification condition must contain exactly eq, in, or is_null");
+      }
+      if (keys[0] === "is_null" ? typeof condition.is_null !== "boolean"
+        : keys[0] === "eq" ? !scalar(condition.eq)
+        : !Array.isArray(condition.in) || !condition.in.length || !condition.in.every(scalar)) {
+        throw new Error("notification condition requires eq/in non-null scalars or is_null boolean");
+      }
+    }
+  }
+}
+
 function typeName(value: string): string {
   let output = "";
   let uppercase = true;
@@ -156,7 +201,7 @@ function parseSchema(source: string): { tables: ParsedTable[]; realtimeTables: S
   const root = object(value, "schema root");
   if (!Object.keys(root).length) throw new Error("schema must declare at least one table");
 
-  const projectMetadata = new Set(["$buckets", "$policies", "$auth", "$email", "$origins", "$realtime", "$notifications", "$push"]);
+  const projectMetadata = new Set(["$buckets", "$policies", "$auth", "$email", "$origins", "$realtime", "$notifications", "$push", "$handles"]);
   for (const key of Object.keys(root).filter((key) => key.startsWith("$"))) {
     if (!projectMetadata.has(key)) throw new Error(`unknown project metadata \`${key}\``);
   }
@@ -276,6 +321,32 @@ function parseSchema(source: string): { tables: ParsedTable[]; realtimeTables: S
         if (!field || field.token !== "json" || !field.nullable) throw new Error("notification presentation_field must name a nullable json field");
       }
     } else if (Array.isArray(config.events) && config.events.length) throw new Error("notification events require an inbox table");
+    validateNotificationEvents(config.events, tables);
+  }
+  if (root.$handles !== undefined) {
+    const policies = object(root.$handles, "`$handles`");
+    for (const [tableName, raw] of Object.entries(policies)) {
+      const policy = object(raw, `handle policy ${tableName}`);
+      if (Object.keys(policy).some(key => !["field", "scope", "source"].includes(key))) throw new Error("unknown handle policy setting");
+      const table = tables.find(table => table.name === tableName);
+      if (!table || table.primaryKey.size !== 1 || !table.primaryKey.has("id")) throw new Error("handle policies require a table with a single id primary key");
+      const field = table.fields.find(field => field.name === policy.field);
+      if (!field || field.token !== "text" || field.name === "id" || field.hasDefault) throw new Error("handle field must be text with no default");
+      const scope = table.fields.find(field => field.name === policy.scope);
+      if (!scope || scope.nullable || scope.name === field.name || !["text", ...tables.map(table => table.name)].includes(scope.token ?? "")) throw new Error("handle scope must be required text/reference");
+      const path = typeof policy.source === "string" ? policy.source.split(".") : [];
+      const reference = table.fields.find(field => field.name === path[0]);
+      const target = tables.find(table => table.name === reference?.token);
+      const source = target?.fields.find(field => field.name === path[1]);
+      if (path.length !== 2 || !reference || reference.nullable || !source || source.nullable || source.token !== "text") throw new Error("handle source must follow a foreign key to required text");
+      const indexes = object(root[tableName], tableName).$indexes;
+      if (!Array.isArray(indexes) || !indexes.some(raw => {
+        const unique = raw && typeof raw === "object" ? (raw as Record<string, unknown>).unique : undefined;
+        return Array.isArray(unique) && unique.length === 2 && unique[0] === policy.scope && unique[1] === policy.field;
+      })) throw new Error("handle policy requires a unique index on [scope, field]");
+      // Loomup supplies this value on CRUD inserts; selected rows retain their schema type.
+      field.hasDefault = true;
+    }
   }
   return { tables, realtimeTables };
 }

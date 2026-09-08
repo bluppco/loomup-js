@@ -1576,3 +1576,51 @@ $push:
   tables: {}
 `), /Messages/);
 });
+
+test("notification events validate participant recipients and relation conditions", () => {
+  const schema = `
+statuses:
+  type: text
+issues:
+  status_id: statuses
+  created_by: text
+  assignee_id: text?
+  deleted_at: datetime?
+notifications:
+  recipient_id: text
+  push_recipient_id: text?
+$notifications:
+  table: notifications
+  events:
+    - type: issue_completed
+      source: issues
+      operations: [UPDATE]
+      changed: status_id
+      recipients: [created_by, assignee_id]
+      when:
+        status_id.type: {in: [completed, closed]}
+        deleted_at: {is_null: true}
+      fields:
+        push_recipient_id: $recipient
+`;
+  assert.match(generateClientSource(schema), /export interface Notifications/);
+  assert.match(generateClientSource(schema.replace("recipients: [created_by, assignee_id]", "recipient: assignee_id")), /export interface Notifications/);
+  for (const [from, to] of [
+    ["recipients: [created_by, assignee_id]", "recipients: []"],
+    ["recipients: [created_by, assignee_id]", "recipients: [missing]"],
+    ["recipients: [created_by, assignee_id]", "recipient: created_by\n      recipients: [assignee_id]"],
+    ["recipients: [created_by, assignee_id]", "recipient: ''"],
+    ["status_id.type", "status_id.missing"],
+    ["status_id.type", "created_by.name"],
+    ["status_id.type", "$actor.name"],
+    ["in: [completed, closed]", "in: []"],
+    ["in: [completed, closed]", "in: [{bad: value}]"],
+    ["is_null: true", "eq: {bad: value}"],
+    ["is_null: true", "gt: 1"],
+    ["is_null: true", "eq: canceled, in: [completed]"],
+    ["is_null: true", "eq: null"],
+    ["is_null: true", "is_null: null"],
+    ["is_null: true", "in: [null]"],
+    ["is_null: true", "is_null: 1"],
+  ]) assert.throws(() => generateClientSource(schema.replace(from!, to!)), /notification/, to);
+});

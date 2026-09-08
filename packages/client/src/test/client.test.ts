@@ -2057,11 +2057,23 @@ describe("storage API", () => {
       );
       assert.equal(signed.expires_at, 123);
       assert.ok(calls[0].url.includes("/storage/v1/attachments/sign/a%20b/file.pdf"));
-      assert.deepEqual(JSON.parse(calls[0].body), { expires_in: 600 });
+      assert.deepEqual(JSON.parse(calls[0].body), { expires_in: 600, delivery: "cdn" });
     } finally {
       if (prev) g.fetch = prev;
       else delete g.fetch;
     }
+  });
+
+  it("preserves an absolute CDN signed URL for a hosted project", async () => {
+    const previous = globalThis.fetch;
+    const cdnUrl = "https://cdn.tryloomup.com/p/project-1/storage/v1/files/object/a.txt?token=v2.signed";
+    globalThis.fetch = (async () => Response.json({ data: { url: cdnUrl, expires_at: 123 } })) as typeof fetch;
+    try {
+      const client = createClient({ url: "https://tryloomup.com/p/project-1", token: "access" });
+      const result = await client.storage.from("files").createSignedUrl("a.txt");
+      assert.equal(result.url, cdnUrl);
+      assert.equal(result.expires_at, 123);
+    } finally { globalThis.fetch = previous; }
   });
 });
 

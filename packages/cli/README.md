@@ -258,3 +258,59 @@ inspect per-device delivery diagnostics.
 
 See the [notification guide](https://tryloomup.com/docs/push) for schema examples,
 permissions, payload limits, fallback behavior, and the complete REST contract.
+
+### Conditional events with multiple recipients
+
+A notification event can use either the existing `recipient` source field or a
+non-empty `recipients` list. An optional `when` map combines conditions with AND.
+Each condition contains exactly `eq` with a non-null scalar JSON value,
+`in` with a non-empty list of non-null scalar values, or `is_null` with a boolean.
+Use `is_null: true` for null and `is_null: false` for non-null. This explicit
+operator round-trips through Loomup’s persisted TOML configuration. Conditions use source fields or
+validated foreign-key paths; unknown fields and operators are rejected.
+
+```yaml
+# Under $notifications.events; declare the type, template and mapped inbox fields too.
+- type: issue_completed
+  source: issues
+  operations: [UPDATE]
+  changed: status_id
+  recipients: [created_by, assignee_id]
+  when:
+    status_id.type: {in: [completed, closed]}
+    deleted_at: {is_null: true}
+  fields:
+    push_recipient_id: $recipient
+    issue_id: id
+    actor_name: $actor.name
+```
+
+The journal's committed after-image supplies recipient IDs and source values
+(the before-image is used for DELETE). Foreign-key conditions resolve against
+current related rows when the event is projected, just like mapped relation
+fields. Editing a related status definition alone does not trigger this event.
+The authenticated journal actor is used unless `actor` is explicitly configured;
+never trust a client-authored `updated_by` field for self-delivery suppression.
+
+Missing/null recipients, duplicate user IDs and the actor are omitted.
+`$recipient` maps the current recipient ID, including for push delivery fields.
+All recipients for a rule commit in one transaction; failures roll back the group
+and the durable consumer retries. Multi-recipient keys encode the legacy base
+key plus recipient ID as a JSON tuple with a `recipients:` prefix. Without
+`dedupe`, the base key includes the notification type and journal event ID, so
+reopening and completing again is a new notification. Existing `recipient`
+configurations retain their keys and custom `dedupe` behavior unchanged.
+Inbox read rules and push notify rules continue to determine access. Push
+preferences affect delivery, not inbox creation. Provider delivery remains
+at-least-once; this guarantees idempotent inbox projection, not exactly-once
+provider delivery.
+
+### Workspace handles
+
+`$handles` maps table names to `{ field, scope, source }`, for example
+`workspace_memberships: { field: handle, scope: workspace_id, source: user_id.email }`.
+The handle field must be text without a default, scope must be required, source
+must follow one foreign key to required text, and `[scope, field]` must have a
+unique index. Loomup assigns missing handles on CRUD insertion. Generated insert
+types therefore make the handle optional even when selected rows require it.
+This metadata requires a backend release supporting scoped handles.
