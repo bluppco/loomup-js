@@ -310,6 +310,30 @@ describe("resource facade", () => {
     }
   });
 
+  it("accepts terminal and empty successful history pages without another request", async () => {
+    const originalFetch = globalThis.fetch;
+    const pages = [
+      { data: [{ sequence: 1, after: { id: 1, title: "last" } }], meta: { limit: 1, next_before_sequence: null } },
+      { data: [], meta: { limit: 1, next_before_sequence: null } },
+    ];
+    let calls = 0;
+    globalThis.fetch = (async () => new Response(JSON.stringify(pages[calls++]), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    })) as typeof fetch;
+    try {
+      const project = createProject<Tables, Inserts, Updates>({ url: "http://example.test" });
+      const terminal = await project.todos.history(1, { limit: 1 });
+      assert.equal(terminal.meta.next_before_sequence, null);
+      assert.equal(terminal.data[0]?.after?.title, "last");
+      const empty = await project.todos.history(2, { limit: 1 });
+      assert.deepEqual(empty.data, []);
+      assert.equal(empty.meta.next_before_sequence, null);
+      assert.equal(calls, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("exposes history, point-in-time state, and permissions on one resource", async () => {
     const calls: string[] = [];
     const originalFetch = globalThis.fetch;
