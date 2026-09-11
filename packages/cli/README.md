@@ -3,8 +3,16 @@
 Schema apply is submitted as a durable asynchronous project operation. The CLI
 polls until it succeeds or fails, so closing the original HTTP connection does
 not strand an apply or leave the project indefinitely in maintenance. Each
-poll request has a 30-second network timeout and the command reports the
-operation URL if the 150-second command budget expires.
+poll request has a 30-second network timeout. There is no overall polling
+deadline: online backup verification can take several minutes. Temporary network
+errors and 408/429/5xx responses retry with backoff. The CLI prints the operation
+URL immediately; interrupting the command stops waiting without cancelling the
+server operation. Authentication errors still fail immediately.
+
+Atomic hosted migrations report a **Recovery point**, which predates any writes
+made during online preparation. Failed migrations use SQLite transaction rollback;
+that earlier snapshot is never automatically restored over newer writes. Legacy
+servers continue to report a **Rollback snapshot**.
 
 Declare a Loomup project's tables, fields, types, defaults, and indexes in YAML.
 Loomup derives and safely reconciles the database schema; application developers

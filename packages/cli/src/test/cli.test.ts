@@ -1624,3 +1624,100 @@ $notifications:
     ["is_null: true", "is_null: 1"],
   ]) assert.throws(() => generateClientSource(schema.replace(from!, to!)), /notification/, to);
 });
+
+test("migrate keeps polling beyond 150 seconds and retries transient status failures", { timeout: 15_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "loomup-online-schema-"));
+  const logs = output();
+  const report = { project_id: "p1", schema_sha256: "abcdef1234567890", revision: 2, applied: true,
+    plan: { actions: [], blockers: [], warnings: [] }, rollback_strategy: "sqlite_transaction",
+    recovery_point: { id: "online-point" } };
+  const operation = { id: "op1", project_id: "p1", kind: "project_schema_migration", state: "running", stage: "snapshotting" };
+  let polls = 0;
+  let submissions = 0;
+  const realNow = Date.now.bind(Date);
+  let elapsed = 0;
+  t.mock.method(Date, "now", () => realNow() + elapsed);
+  const server = createServer((request, response) => {
+    let raw = "";
+    request.on("data", (chunk) => { raw += chunk; });
+    request.on("end", () => {
+      response.setHeader("Content-Type", "application/json");
+      if (request.method === "GET") {
+        polls++;
+        elapsed = 300_000;
+        if (polls === 1) {
+          response.writeHead(503);
+          response.end(JSON.stringify({ error: { message: "temporary overload" } }));
+        } else {
+          response.end(JSON.stringify({ data: polls === 2 ? { ...operation, stage: "rehearsing" } : { ...operation, state: "succeeded", result: report } }));
+        }
+      } else {
+        const body = JSON.parse(raw);
+        if (body.dry_run) response.end(JSON.stringify({ data: { ...report, applied: false } }));
+        else {
+          submissions++;
+          response.writeHead(202);
+          response.end(JSON.stringify({ data: operation }));
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  await writeFile(join(directory, "package.json"), JSON.stringify({ name: "fixture", loomup: { url: `http://127.0.0.1:${address.port}`, project: "p1", schema: "loomup.schema.yaml" } }));
+  await writeFile(join(directory, "loomup.schema.yaml"), "items:\n  title: text\n");
+  process.env.LOOMUP_API_KEY = "loomup_sk_test";
+  try {
+    assert.equal(await runCli(["migrate"], { cwd: directory, io: logs.io }), 0);
+  } finally {
+    server.close();
+  }
+  assert.equal(submissions, 1);
+  assert.equal(polls, 3);
+  assert.ok(logs.stdout.some((line) => line === "Recovery point: online-point"));
+  assert.ok(logs.stderr.some((line) => line.includes("/operations/op1")));
+  assert.ok(logs.stderr.some((line) => line.includes("rehearsing")));
+  assert.equal(process.listenerCount("SIGINT"), 0);
+});
+
+test("interrupting operation polling preserves its URL and does not cancel the server operation", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "loomup-interrupt-schema-"));
+  const logs = output();
+  let cancelled = false;
+  const report = { project_id: "p1", schema_sha256: "abcdef1234567890", revision: 1, applied: false,
+    plan: { actions: [], blockers: [], warnings: [] } };
+  const server = createServer((request, response) => {
+    let raw = "";
+    request.on("data", (chunk) => { raw += chunk; });
+    request.on("end", () => {
+      if (request.url?.endsWith("/cancel")) cancelled = true;
+      response.setHeader("Content-Type", "application/json");
+      if (request.method === "GET") {
+        // Interruption must abort an in-flight poll, not wait for its network timeout.
+        process.emit("SIGINT");
+      } else {
+        const body = JSON.parse(raw);
+        response.writeHead(body.dry_run ? 200 : 202);
+        response.end(JSON.stringify({ data: body.dry_run ? report : {
+          id: "interrupt-op", project_id: "p1", kind: "project_schema_migration", state: "running", stage: "snapshotting",
+        } }));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  await writeFile(join(directory, "package.json"), JSON.stringify({ name: "fixture", loomup: { url: `http://127.0.0.1:${address.port}`, project: "p1", schema: "loomup.schema.yaml" } }));
+  await writeFile(join(directory, "loomup.schema.yaml"), "items:\n  title: text\n");
+  process.env.LOOMUP_API_KEY = "loomup_sk_test";
+  try {
+    assert.equal(await runCli(["migrate"], { cwd: directory, io: logs.io }), 130);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+  assert.equal(cancelled, false);
+  assert.ok(logs.stderr.some((line) => line.includes("operation continues") && line.includes("/operations/interrupt-op")));
+  assert.equal(process.listenerCount("SIGINT"), 0);
+});

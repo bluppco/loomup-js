@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
 import process from "node:process";
+import { setTimeout as sleep } from "node:timers/promises";
 import { DEFAULT_CLIENT_PATH, generateClient } from "./generate.js";
 import { loadAndCompileAccess } from "./access.js";
 
@@ -43,6 +44,8 @@ type SchemaReport = {
   plan: SchemaPlan;
   applied: boolean;
   rollback_snapshot?: { id?: string };
+  recovery_point?: { id?: string };
+  rollback_strategy?: "sqlite_transaction";
 };
 
 type DataListMeta = {
@@ -197,6 +200,7 @@ class CliError extends Error {
   constructor(
     message: string,
     readonly exitCode = 1,
+    readonly retryable = false,
   ) {
     super(message);
   }
@@ -502,39 +506,43 @@ async function requestJson<T>(
   token: string | undefined,
   init?: RequestInit,
 ): Promise<T> {
-  let response: Response;
-  const timeout = AbortSignal.timeout(30_000);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  init?.signal?.addEventListener("abort", abort, { once: true });
+  if (init?.signal?.aborted) controller.abort();
+  const timer = setTimeout(abort, 30_000);
   try {
-    response = await fetch(url, {
-      ...init,
-      signal: init?.signal ?? timeout,
-      headers: {
-        Accept: "application/json",
-        ...(init?.body ? { "Content-Type": "application/json" } : {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(init?.headers ?? {}),
-      },
-    });
-  } catch (error) {
-    throw new CliError(`cannot reach Loomup: ${String(error)}`);
+    let response: Response;
+    let text: string;
+    try {
+      response = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+        headers: {
+          Accept: "application/json",
+          ...(init?.body ? { "Content-Type": "application/json" } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(init?.headers ?? {}),
+        },
+      });
+      text = await response.text();
+    } catch (error) {
+      throw new CliError(`cannot reach Loomup: ${String(error)}`, 1, true);
+    }
+    let body: any = {};
+    try { body = text ? JSON.parse(text) : {}; }
+    catch { body = { raw: text }; }
+    if (!response.ok) {
+      const message = body?.error?.message ?? body?.message ?? text ?? response.statusText;
+      const code = response.status === 400 || response.status === 422 ? 2 : 1;
+      throw new CliError(`Loomup ${response.status}: ${String(message)}`, code,
+        response.status >= 500 || response.status === 408 || response.status === 429);
+    }
+    return body as T;
+  } finally {
+    clearTimeout(timer);
+    init?.signal?.removeEventListener("abort", abort);
   }
-  const text = await response.text();
-  let body: any = {};
-  try {
-    body = text ? JSON.parse(text) : {};
-  } catch {
-    body = { raw: text };
-  }
-  if (!response.ok) {
-    const message = body?.error?.message ?? body?.message ?? text ?? response.statusText;
-    const code = response.status === 400 || response.status === 422 ? 2 : 1;
-    throw new CliError(`Loomup ${response.status}: ${String(message)}`, code);
-  }
-  return body as T;
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function isProjectOperation(value: unknown): value is ProjectOperation {
@@ -556,22 +564,44 @@ async function waitForProjectOperation(
   jsonOutput: boolean,
 ): Promise<SchemaReport> {
   const endpoint = `${platformUrl}/platform/api/projects/${encodeURIComponent(projectId)}/operations/${encodeURIComponent(operation.id)}`;
-  const deadline = Date.now() + 150_000;
   let current = operation;
   let reportedStage = "";
-  while (current.state === "queued" || current.state === "running") {
-    if (!jsonOutput && current.stage !== reportedStage) {
-      io.stderr(`Schema operation ${current.stage}…`);
-      reportedStage = current.stage;
+  let retryDelay = 500;
+  const waiting = new AbortController();
+  const interrupt = () => waiting.abort();
+  process.on("SIGINT", interrupt);
+  process.on("SIGTERM", interrupt);
+  // Print the durable URL up front so even a hard process interruption leaves
+  // the caller a way to inspect the operation without submitting it again.
+  io.stderr(`Schema operation: ${endpoint}`);
+  try {
+    while (current.state === "queued" || current.state === "running") {
+      if (waiting.signal.aborted) throw new CliError(`Stopped waiting; the operation continues at ${endpoint}`, 130);
+      if (!jsonOutput && current.stage !== reportedStage) {
+        io.stderr(`Schema operation ${current.stage}…`);
+        reportedStage = current.stage;
+      }
+      await sleep(retryDelay, undefined, { signal: waiting.signal });
+      if (waiting.signal.aborted) throw new CliError(`Stopped waiting; the operation continues at ${endpoint}`, 130);
+      try {
+        const response = await requestJson<ApiEnvelope<ProjectOperation>>(endpoint, token, { signal: waiting.signal });
+        if (!isProjectOperation(response.data) || response.data.id !== operation.id) {
+          throw new CliError(`Invalid operation response; inspect ${endpoint}`);
+        }
+        current = response.data;
+        retryDelay = 500;
+      } catch (error) {
+        if (!(error instanceof CliError) || !error.retryable) throw error;
+        retryDelay = Math.min(retryDelay * 2, 10_000);
+        if (!jsonOutput) io.stderr(`Operation status temporarily unavailable; retrying. ${endpoint}`);
+      }
     }
-    if (Date.now() >= deadline) {
-      throw new CliError(
-        `schema operation ${current.id} did not finish within 150 seconds; inspect it at ${endpoint}`,
-      );
-    }
-    await delay(500);
-    const response = await requestJson<ApiEnvelope<ProjectOperation>>(endpoint, token);
-    current = response.data;
+  } catch (error) {
+    if (waiting.signal.aborted) throw new CliError(`Stopped waiting; the operation continues at ${endpoint}`, 130);
+    throw error;
+  } finally {
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", interrupt);
   }
   if (current.state === "succeeded" && current.result) return current.result;
   if (current.state === "cancelled") {
@@ -758,7 +788,9 @@ async function migrate(
   } else {
     printPlan(applied, io);
     io.stdout(`Applied schema revision ${applied.revision}.`);
-    if (applied.rollback_snapshot?.id) {
+    if (applied.recovery_point?.id) {
+      io.stdout(`Recovery point: ${applied.recovery_point.id}`);
+    } else if (applied.rollback_snapshot?.id) {
       io.stdout(`Rollback snapshot: ${applied.rollback_snapshot.id}`);
     }
   }
@@ -1434,7 +1466,7 @@ async function login(
       body: JSON.stringify({ email, password }),
     });
   } catch (error) {
-    throw new CliError(`cannot reach Loomup: ${String(error)}`);
+    throw new CliError(`cannot reach Loomup: ${String(error)}`, 1, true);
   }
   if (!response.ok) {
     throw new CliError(`login failed (${response.status})`);
