@@ -38,10 +38,13 @@ type WorkspaceProjectConfig = {
     invitations?: string;
   };
   publicWorkspaces?: boolean;
+  projectRoles?: boolean;
   publishedContent?: PublishedContent[];
   memberContent?: string[];
   comments?: string[];
-  notifications?: Array<{ table: string; recipientField?: string }>;
+  notifications?: Array<{ table: string; recipientField?: string; allowDelete?: boolean }>;
+  projectUserFields?: Array<{ table: string; field: string; nullable?: boolean; guardRemoval?: boolean }>;
+  issueParents?: Array<{ table: string; field: string }>;
   ownedUploads?: string[];
   serviceOnly?: string[];
   objects?: Array<{ table: string; pathField?: string }>;
@@ -81,6 +84,18 @@ function strings(value: unknown, context: string): string[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) fail(`${context} must be an array`);
   return value.map((entry, index) => string(entry, `${context}[${index}]`));
+}
+
+function boolean(value: unknown, context: string): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== "boolean") fail(`${context} must be a boolean`);
+  return value;
+}
+
+function definitions(value: unknown, context: string): Record<string, unknown>[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) fail(`${context} must be an array`);
+  return value.map((item, index) => object(item, `${context}[${index}]`));
 }
 
 function parseSchema(source: string): SchemaShape {
@@ -150,6 +165,7 @@ function validateConfig(value: unknown): AccessConfig {
         const item = object(raw, `notifications[${index}]`);
         return {
           table: string(item.table, `notifications[${index}].table`),
+          allowDelete: boolean(item.allowDelete, `notifications[${index}].allowDelete`),
           recipientField: item.recipientField === undefined
             ? undefined
             : string(item.recipientField, `notifications[${index}].recipientField`),
@@ -168,10 +184,21 @@ function validateConfig(value: unknown): AccessConfig {
       invitations: optional("invitations"),
     },
     publicWorkspaces: config.publicWorkspaces === true,
+    projectRoles: boolean(config.projectRoles, "projectRoles"),
     publishedContent,
     memberContent: strings(config.memberContent, "memberContent"),
     comments: strings(config.comments, "comments"),
     notifications,
+    projectUserFields: definitions(config.projectUserFields, "projectUserFields").map((item, index) => ({
+      table: string(item.table, `projectUserFields[${index}].table`),
+      field: string(item.field, `projectUserFields[${index}].field`),
+      nullable: boolean(item.nullable, `projectUserFields[${index}].nullable`),
+      guardRemoval: boolean(item.guardRemoval, `projectUserFields[${index}].guardRemoval`),
+    })),
+    issueParents: definitions(config.issueParents, "issueParents").map((item, index) => ({
+      table: string(item.table, `issueParents[${index}].table`),
+      field: string(item.field, `issueParents[${index}].field`),
+    })),
     ownedUploads: strings(config.ownedUploads, "ownedUploads"),
     serviceOnly: strings(config.serviceOnly, "serviceOnly"),
     objects,
@@ -238,6 +265,8 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
     ...(config.publishedContent ?? []).flatMap((item) => [item.table, item.departments]),
     ...(config.memberContent ?? []), ...(config.comments ?? []),
     ...(config.notifications ?? []).map((item) => item.table),
+    ...(config.projectUserFields ?? []).map((item) => item.table),
+    ...(config.issueParents ?? []).map((item) => item.table),
     ...(config.ownedUploads ?? []), ...(config.serviceOnly ?? []),
     ...(config.objects ?? []).map((item) => item.table),
   ].filter((name): name is string => Boolean(name));
@@ -250,6 +279,20 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
     if (!table(tableName).fields.has(fieldName)) fail(`field ${tableName}.${fieldName} does not exist`);
     return `row.${fieldName}`;
   };
+  if (config.projectRoles) {
+    field(t.projectMembers, "role");
+    field(t.projectMembers, "workspace_id");
+  }
+  for (const target of config.projectUserFields ?? []) {
+    if (table(target.table).fields.get(target.field) !== t.users) fail(`${target.table}.${target.field} must reference ${t.users}`);
+    field(target.table, "workspace_id");
+    field(target.table, "project_id");
+    field(t.projectMembers, "workspace_id");
+  }
+  for (const target of config.issueParents ?? []) {
+    if (table(target.table).fields.get(target.field) !== target.table) fail(`${target.table}.${target.field} must reference itself`);
+    for (const name of ["workspace_id", "project_id", "deleted_at"]) field(target.table, name);
+  }
   const relationPath = (from: string, to: string): Array<{ from: string; field: string; to: string }> | undefined => {
     if (from === to) return [];
     const queue: Array<{ name: string; path: Array<{ from: string; field: string; to: string }> }> = [{ name: from, path: [] }];
@@ -308,7 +351,11 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
   const admin = (from: string) => or(membership(from, "owner"), membership(from, "admin"));
   const workspaceCreator = (from: string) =>
     `exists(${t.workspaces}, id = ${workspaceId(from)}, created_by = auth.uid())`;
-  const editor = (from: string) => or(
+  const projectScope = (from: string) => `${workspaceId(from)} = lookup(${t.projects}, workspace_id, id = ${projectId(from)})`;
+  const projectRole = (from: string, role: string) => and(member(from), projectScope(from),
+    `exists(${t.projectMembers}, workspace_id = ${workspaceId(from)}, project_id = ${projectId(from)}, user_id = auth.uid(), role = ${quote(role)})`);
+  const owner = (from: string) => and(projectScope(from), or(admin(from), projectRole(from, "owner")));
+  const editor = (from: string) => config.projectRoles ? or(owner(from), projectRole(from, "editor")) : or(
     admin(from),
     `exists(${t.projects}, id = ${projectId(from)}, created_by = auth.uid())`,
     `exists(${t.projectMembers}, project_id = ${projectId(from)}, user_id = auth.uid())`,
@@ -317,13 +364,17 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
     const project = projectId(from);
     const choices = [
       editor(from),
+      ...(config.projectRoles ? [projectRole(from, "viewer")] : []),
       `exists(${t.projects}, id = ${project}, visibility = 'public')`,
       and(member(from), `exists(${t.projects}, id = ${project}, audience = 'everyone')`),
     ];
     if (t.projectDepartments) {
-      choices.push(`exists(${t.projectDepartments}, project_id = ${project}, department_id = lookup(${t.memberships}, department_id, workspace_id = ${workspaceId(from)}, user_id = auth.uid()))`);
+      choices.push(config.projectRoles ? and(member(from),
+        `exists(${t.projects}, id = ${project}, audience = 'departments')`,
+        `exists(${t.projectDepartments}, workspace_id = ${workspaceId(from)}, project_id = ${project}, department_id = lookup(${t.memberships}, department_id, workspace_id = ${workspaceId(from)}, user_id = auth.uid()))`)
+        : `exists(${t.projectDepartments}, project_id = ${project}, department_id = lookup(${t.memberships}, department_id, workspace_id = ${workspaceId(from)}, user_id = auth.uid()))`);
     }
-    return or(...choices);
+    return config.projectRoles ? and(projectScope(from), or(...choices)) : or(...choices);
   };
 
   const publishedRoots = config.publishedContent ?? [];
@@ -374,26 +425,40 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
       const recipient = `${field(tableName, "email")} = lookup(${t.users}, email, id = auth.uid())`;
       rules = access(or(admin(tableName), recipient), admin(tableName), admin(tableName), or(admin(tableName), recipient));
     } else if (tableName === t.projects) {
-      const read = or(`${field(tableName, "visibility")} = 'public'`, member(tableName));
-      rules = access(read, member(tableName), editor(tableName), editor(tableName));
+      const read = config.projectRoles ? projectReader(tableName) : or(`${field(tableName, "visibility")} = 'public'`, member(tableName));
+      rules = config.projectRoles
+        ? access(read, and(member(tableName), `${field(tableName, "created_by")} = auth.uid()`), owner(tableName), owner(tableName))
+        : access(read, member(tableName), editor(tableName), editor(tableName));
     } else if (tableName === t.projectMembers) {
-      const read = or(`${field(tableName, "user_id")} = auth.uid()`, editor(tableName));
-      rules = access(read, editor(tableName), editor(tableName), editor(tableName));
+      if (config.projectRoles) {
+        const read = and(member(tableName), projectReader(tableName));
+        const targetMember = `exists(${t.memberships}, workspace_id = ${workspaceId(tableName)}, user_id = ${field(tableName, "user_id")})`;
+        const manage = and(owner(tableName), targetMember);
+        rules = access(read, manage, manage, owner(tableName));
+      } else {
+        const read = or(`${field(tableName, "user_id")} = auth.uid()`, editor(tableName));
+        rules = access(read, editor(tableName), editor(tableName), editor(tableName));
+      }
     } else if (tableName === t.projectDepartments) {
       const ownDepartment = `${field(tableName, "department_id")} = lookup(${t.memberships}, department_id, workspace_id = ${workspaceId(tableName)}, user_id = auth.uid())`;
-      rules = access(or(ownDepartment, editor(tableName)), editor(tableName), editor(tableName), editor(tableName));
+      const consistent = `${workspaceId(tableName)} = lookup(${t.departments}, workspace_id, id = ${field(tableName, "department_id")})`;
+      rules = config.projectRoles
+        ? access(and(member(tableName), projectReader(tableName)), and(owner(tableName), consistent), and(owner(tableName), consistent), owner(tableName))
+        : access(or(ownDepartment, editor(tableName)), editor(tableName), editor(tableName), editor(tableName));
     } else if ((config.ownedUploads ?? []).includes(tableName)) {
       const owned = `${field(tableName, "created_by")} = auth.uid()`;
-      rules = access(owned, and(owned, editor(tableName)), owned, owned);
+      const manage = and(owned, editor(tableName));
+      rules = config.projectRoles ? access(manage, manage, manage, manage) : access(owned, manage, owned, owned);
     } else if ((config.comments ?? []).includes(tableName)) {
       const read = and(member(tableName), projectReader(tableName));
       const owned = `${field(tableName, "created_by")} = auth.uid()`;
-      rules = access(read, and(owned, read), and(owned, read), and(owned, read));
+      const manage = config.projectRoles ? and(owned, read, editor(tableName)) : and(owned, read);
+      rules = access(read, manage, manage, manage);
     } else if ((config.notifications ?? []).some((item) => item.table === tableName)) {
       const definition = config.notifications!.find((item) => item.table === tableName)!;
       const recipient = `${field(tableName, definition.recipientField ?? "recipient_id")} = auth.uid()`;
-      const read = and(recipient, projectReader(tableName));
-      rules = { read, create: deny, update: read, delete: deny, subscribe: read, notify: read };
+      const read = and(member(tableName), recipient, projectReader(tableName));
+      rules = { read, create: deny, update: read, delete: definition.allowDelete === true ? read : deny, subscribe: read, notify: read };
     } else {
       const commentRoot = nearestRoot(tableName, (config.comments ?? []).map((name) => ({ table: name })));
       const publishedRoot = nearestRoot(tableName, publishedRoots);
@@ -419,7 +484,7 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
             ? [`${field(tableName, fieldName)} = ${valueAlongPath(tableName, [...parentPath, ...rootToTarget], "id")}`]
             : [];
         });
-        const managed = and(parentOwned, ...consistentScope, read);
+        const managed = and(parentOwned, ...consistentScope, read, ...(config.projectRoles ? [editor(tableName)] : []));
         rules = access(read, managed, deny, managed);
       } else if (publishedDepartment) {
         const ownDepartment = `${field(tableName, "department_id")} = lookup(${t.memberships}, department_id, workspace_id = ${workspaceId(tableName)}, user_id = auth.uid())`;
@@ -427,8 +492,9 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
       } else if (publishedRoot) {
         rules = access(publishedReader(tableName, publishedRoot), editor(tableName), editor(tableName), editor(tableName));
       } else if (memberRoot) {
-        const read = and(member(tableName), projectReader(tableName));
-        rules = access(read, editor(tableName), editor(tableName), editor(tableName));
+        const read = and(member(tableName), projectScope(tableName), projectReader(tableName));
+        const manage = and(read, editor(tableName));
+        rules = access(read, manage, manage, manage);
       } else if (hasPath(tableName, t.projects)) {
         rules = access(projectReader(tableName), editor(tableName), editor(tableName), editor(tableName));
       } else if (hasPath(tableName, t.workspaces)) {
@@ -441,6 +507,35 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
       } else {
         rules = access(authenticated, authenticated, authenticated, authenticated);
       }
+    }
+    // Target eligibility supplements actor authorization; it never widens it.
+    for (const target of config.projectUserFields ?? []) {
+      if (tableName === target.table) {
+        const user = field(tableName, target.field);
+        const eligible = and(
+          `exists(${t.memberships}, workspace_id = ${workspaceId(tableName)}, user_id = ${user})`,
+          `exists(${t.projectMembers}, workspace_id = ${workspaceId(tableName)}, project_id = ${projectId(tableName)}, user_id = ${user})`);
+        const allowedTarget = target.nullable ? or(`${user} = null`, eligible) : eligible;
+        rules.create = and(rules.create, allowedTarget);
+        rules.update = and(rules.update, allowedTarget);
+      }
+      if (target.guardRemoval && (tableName === t.projectMembers || tableName === t.memberships)) {
+        const scope = [`workspace_id = ${field(tableName, "workspace_id")}`, `${target.field} = ${field(tableName, "user_id")}`];
+        if (tableName === t.projectMembers) scope.push(`project_id = ${field(tableName, "project_id")}`);
+        rules.delete = and(rules.delete, `lookup(${target.table}, id, ${scope.join(", ")}) = null`);
+        const immutable = ["workspace_id", "user_id", ...(tableName === t.projectMembers ? ["project_id"] : [])];
+        rules.update = and(rules.update, ...immutable.map(name => `${field(tableName, name)} = lookup(${tableName}, ${name}, id = ${field(tableName, "id")})`));
+      }
+    }
+    for (const target of config.issueParents ?? []) {
+      if (tableName !== target.table) continue;
+      const parent = field(tableName, target.field);
+      const id = field(tableName, "id");
+      const original = `lookup(${tableName}, ${target.field}, id = ${id})`;
+      rules.create = and(rules.create, or(`${parent} = null`, and(
+        `exists(${tableName}, id = ${parent}, id != ${id}, workspace_id = ${workspaceId(tableName)}, project_id = ${projectId(tableName)}, deleted_at = null)`)));
+      rules.update = and(rules.update, or(and(`${parent} = null`, `${original} = null`), `${parent} = ${original}`),
+        ...["workspace_id", "project_id"].map(name => `${field(tableName, name)} = lookup(${tableName}, ${name}, id = ${id})`));
     }
     compiled.tables[tableName] = rules;
   }

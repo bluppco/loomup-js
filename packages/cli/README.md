@@ -174,6 +174,46 @@ export default {
 } satisfies LoomupAccessConfig;
 ```
 
+The workspace/project profile also supports explicit project roles and inbox
+deletion without custom policy expressions:
+
+```ts
+export default {
+  profile: "workspace-project",
+  projectRoles: true,
+  memberContent: ["issues"],
+  comments: ["issue_comments"],
+  notifications: [{ table: "notifications", allowDelete: true }],
+  projectUserFields: [
+    { table: "issues", field: "assignee_id", nullable: true, guardRemoval: true },
+    { table: "comment_mentions", field: "user_id" },
+  ],
+  issueParents: [{ table: "issues", field: "parent_issue_id" }],
+} satisfies LoomupAccessConfig<TableMap>;
+```
+
+`projectRoles` is opt-in for schemas with `project_members.role` and
+`workspace_id`. Owners manage projects and membership; editors mutate content;
+viewers read. Workspace owners/admins retain management access. A stale project
+grant or `created_by` never bypasses current workspace membership. Existing
+profiles without this option keep their legacy project-grant behavior.
+
+Notification deletion defaults to denied. `allowDelete: true` permits only the
+recipient, while they still belong to the workspace and can read the project.
+It does not permit creating notifications. Use the generated table's `delete`
+method for individual rows; list and delete matching rows for bulk operations.
+
+`projectUserFields` requires user references and direct `workspace_id` and
+`project_id` fields. New assignments/mentions must target a current member of
+both the workspace and project. `nullable` permits clearing the reference.
+`guardRemoval` blocks membership deletion while references remain (including
+soft-deleted rows) and prevents moving the membership to bypass cleanup.
+
+`issueParents` requires a self-reference plus `workspace_id`, `project_id`, and
+`deleted_at`. At creation a parent must exist, be live, be in the same project
+and workspace, and differ from the child. Parent links and scope cannot change
+after creation; a later parent soft deletion does not prevent editing children.
+
 ```bash
 # Create a project API key with Schema · Apply in Loomup Studio.
 export LOOMUP_API_KEY="loomup_sk_…"

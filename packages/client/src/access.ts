@@ -41,18 +41,33 @@ export type WorkspaceProjectAccess<TTables = Record<string, unknown>> = {
   };
   /** Expose workspace name/slug alongside public projects. Defaults to false. */
   publicWorkspaces?: boolean;
+  /** Use owner/editor/viewer project-member roles. Requires project_members.role and workspace_id. */
+  projectRoles?: boolean;
   /** Project roots whose published records can be read through public/audience rules. */
   publishedContent?: readonly PublishedContentDefinition<TableName<TTables>>[];
   /** Project roots that always require an authenticated workspace member. */
   memberContent?: readonly TableName<TTables>[];
-  /** Comment roots: project readers may create; authors may update/delete. */
+  /** Comment roots: authors may mutate; projectRoles additionally requires an editor role. */
   comments?: readonly TableName<TTables>[];
   /** Server-projected inbox rows visible and acknowledgeable only by their recipient. */
   notifications?: readonly {
     table: TableName<TTables>;
     /** Defaults to `recipient_id`. */
     recipientField?: string;
+    /** Allow recipients to delete rows they can read. Default: false. */
+    allowDelete?: boolean;
   }[];
+  /** User references restricted to current members of the row's workspace and project. */
+  projectUserFields?: readonly {
+    table: TableName<TTables>;
+    field: string;
+    /** Allow an unassigned/null reference. Default: false. */
+    nullable?: boolean;
+    /** Prevent membership removal until references are cleared. Default: false. */
+    guardRemoval?: boolean;
+  }[];
+  /** Immutable parent links to live rows in the same workspace/project; requires deleted_at. */
+  issueParents?: readonly { table: TableName<TTables>; field: string }[];
   /** Staging rows owned by their creator and creatable only by project editors. */
   ownedUploads?: readonly TableName<TTables>[];
   /** Tables inaccessible to user sessions and reserved for project backend keys. */
