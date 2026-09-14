@@ -80,6 +80,21 @@ export type WorkspaceProjectAccess<TTables = Record<string, unknown>> = {
   }[];
 };
 
+/** Backend-owned app data, with optional membership-scoped realtime reads. */
+export type ServerMediatedAccess<TTables = Record<string, unknown>> = {
+  profile: "server-mediated";
+  realtime?: {
+    membership: {
+      table: TableName<TTables>;
+      workspaceField: string;
+      userField: string;
+    };
+    identity: { table: TableName<TTables>; authUserIdField: string };
+    tables: readonly { table: TableName<TTables>; workspaceField: string }[];
+  };
+};
+
 export type LoomupAccessConfig<TTables = Record<string, unknown>> =
   | AuthenticatedAccess
+  | ServerMediatedAccess<TTables>
   | WorkspaceProjectAccess<TTables>;

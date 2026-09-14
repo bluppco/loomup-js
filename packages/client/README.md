@@ -196,3 +196,33 @@ temporary redirect when hosted CDN delivery is enabled. New CDN links are
 revocable: each request rechecks issuer access and object existence. Keep session
 and service credentials on the API origin; the signed URL itself grants download
 access. Upload and metadata APIs are unchanged.
+
+### Backend-owned applications
+
+Choose `profile: "server-mediated"` when application servers authorize all data
+access with scoped project backend keys. User sessions are denied table and
+bucket access by default, including newly added resources. Existing profiles
+are unchanged. An optional realtime mapping grants only reads and subscriptions:
+
+```ts
+export default {
+  profile: "server-mediated",
+  realtime: {
+    membership: { table: "workspace_members", workspaceField: "workspace_id", userField: "user_id" },
+    identity: { table: "users", authUserIdField: "auth_user_id" },
+    tables: [{ table: "dashboard_invalidations", workspaceField: "workspace_id" }],
+  },
+} satisfies LoomupAccessConfig;
+```
+
+The membership user field must reference the application identity table. Its
+`authUserIdField` maps the hosted authentication subject to the application user
+ID; use a unique index on that field. Only rows in a current membership's
+workspace can be read/subscribed. Client writes and notifications remain denied.
+Identity and membership tables cannot be exposed as realtime exceptions.
+Invalid/missing fields or duplicate exceptions stop compilation. Declare the
+exception tables in `$realtime.tables` as well to enable realtime delivery.
+
+Review `loomup migrate --plan` before applying the policies. Service-key CRUD,
+server operations and signed artifact delivery continue to use backend access;
+never expose those keys to browsers.

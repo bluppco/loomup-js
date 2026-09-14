@@ -1,6 +1,6 @@
 {
   "name": "@loomup/react",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "React hooks and provider for Loomup Realtime",
   "type": "module",
   "main": "dist/index.js",

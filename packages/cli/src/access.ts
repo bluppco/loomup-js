@@ -50,7 +50,16 @@ type WorkspaceProjectConfig = {
   objects?: Array<{ table: string; pathField?: string }>;
 };
 
-type AccessConfig = { profile: "authenticated" } | WorkspaceProjectConfig;
+type ServerMediatedConfig = {
+  profile: "server-mediated";
+  realtime?: {
+    membership: { table: string; workspaceField: string; userField: string };
+    identity: { table: string; authUserIdField: string };
+    tables: Array<{ table: string; workspaceField: string }>;
+  };
+};
+
+type AccessConfig = { profile: "authenticated" } | WorkspaceProjectConfig | ServerMediatedConfig;
 type SchemaTable = { fields: Map<string, string | undefined> };
 type SchemaShape = { tables: Map<string, SchemaTable>; buckets: string[] };
 
@@ -130,6 +139,31 @@ function validateConfig(value: unknown): AccessConfig {
   const config = object(value, "default export");
   const profile = string(config.profile, "profile");
   if (profile === "authenticated") return { profile };
+  if (profile === "server-mediated") {
+    if (config.realtime === undefined) return { profile };
+    const realtime = object(config.realtime, "realtime");
+    const membership = object(realtime.membership, "realtime.membership");
+    const identity = object(realtime.identity, "realtime.identity");
+    return {
+      profile,
+      realtime: {
+        membership: {
+          table: string(membership.table, "realtime.membership.table"),
+          workspaceField: string(membership.workspaceField, "realtime.membership.workspaceField"),
+          userField: string(membership.userField, "realtime.membership.userField"),
+        },
+        identity: {
+          table: string(identity.table, "realtime.identity.table"),
+          authUserIdField: string(identity.authUserIdField, "realtime.identity.authUserIdField"),
+        },
+        tables: definitions(realtime.tables, "realtime.tables").map((item, index) => ({
+          table: string(item.table, `realtime.tables[${index}].table`),
+          workspaceField: string(item.workspaceField, `realtime.tables[${index}].workspaceField`),
+        })),
+      },
+    };
+  }
+
   if (profile !== "workspace-project") fail(`unknown profile ${JSON.stringify(profile)}`);
   const tables = config.tables === undefined ? {} : object(config.tables, "tables");
   const optional = (name: string) => tables[name] === undefined ? undefined : required(name);
@@ -559,8 +593,48 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
   return compiled;
 }
 
+function compileServerMediated(shape: SchemaShape, config: ServerMediatedConfig): CompiledAccess {
+  const deny = () => access("false", "false", "false", "false");
+  const compiled: CompiledAccess = {
+    tables: Object.fromEntries([...shape.tables.keys()].map(name => [name, deny()])),
+    buckets: Object.fromEntries(shape.buckets.map(name => [name, deny()])),
+  };
+  if (!config.realtime) return compiled;
+  const identifier = (name: string) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) fail(`invalid identifier ${JSON.stringify(name)}`);
+    return name;
+  };
+  const field = (table: string, name: string) => {
+    identifier(table); identifier(name);
+    if (!shape.tables.get(table)?.fields.has(name)) fail(`field ${table}.${name} does not exist`);
+    return name;
+  };
+  const { membership, identity, tables } = config.realtime;
+  field(identity.table, "id");
+  field(identity.table, identity.authUserIdField);
+  field(membership.table, membership.workspaceField);
+  field(membership.table, membership.userField);
+  if (shape.tables.get(membership.table)!.fields.get(membership.userField) !== identity.table) {
+    fail(`${membership.table}.${membership.userField} must reference ${identity.table}`);
+  }
+  const seen = new Set<string>();
+  for (const target of tables) {
+    field(target.table, target.workspaceField);
+    if (target.table === identity.table || target.table === membership.table) fail("identity and membership tables must remain service-only");
+    if (seen.has(target.table)) fail(`duplicate realtime table ${target.table}`);
+    seen.add(target.table);
+    const user = `lookup(${identity.table}, id, ${identity.authUserIdField} = auth.uid())`;
+    const read = and("auth.uid() != null", `${user} != null`,
+      `exists(${membership.table}, ${membership.workspaceField} = row.${target.workspaceField}, ${membership.userField} = ${user})`);
+    compiled.tables[target.table] = access(read, "false", "false", "false");
+  }
+  return compiled;
+}
+
 export function compileAccess(schemaSource: string, config: AccessConfig): CompiledAccess {
+  config = validateConfig(config);
   const shape = parseSchema(schemaSource);
+  if (config.profile === "server-mediated") return compileServerMediated(shape, config);
   if (config.profile === "authenticated") {
     const authenticated = access(
       "auth.uid() != null",
