@@ -257,6 +257,10 @@ export type StorageBucketInfo = {
   public: boolean;
 };
 
+export type StorageUploadSession = {
+  id: string; path: string; size: number; offset: number; chunk_size: number; expires_at: number;
+};
+
 export type StorageUploadOptions = {
   /** MIME type (e.g. `image/png`). */
   contentType?: string;
@@ -2971,12 +2975,79 @@ export class StorageBucket {
     return `/storage/v1/${encodeURIComponent(this.bucket)}/object/${encodeObjectPath(path)}`;
   }
 
+  private uploadUrl(id?: string): string {
+    return `/storage/v1/${encodeURIComponent(this.bucket)}/uploads${id ? `/${encodeURIComponent(id)}` : ""}`;
+  }
+
+  async createUpload(path: string, size: number, options?: StorageUploadOptions): Promise<StorageUploadSession> {
+    const response = await this.client.requestStorage("POST", this.uploadUrl(), {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, size, content_type: options?.contentType, upsert: options?.upsert ?? false }),
+    }) as { data: StorageUploadSession };
+    return response.data;
+  }
+
+  async uploadChunk(id: string, offset: number, chunk: Blob): Promise<StorageUploadSession> {
+    const response = await this.client.requestStorage("PUT", `${this.uploadUrl(id)}?offset=${offset}`, {
+      headers: { "Content-Type": "application/octet-stream" }, body: chunk,
+    }) as { data: StorageUploadSession };
+    return response.data;
+  }
+
+  async uploadStatus(id: string): Promise<StorageUploadSession> {
+    return (await this.client.requestStorage("GET", this.uploadUrl(id)) as { data: StorageUploadSession }).data;
+  }
+
+  async completeUpload(id: string): Promise<StorageObject> {
+    return (await this.client.requestStorage("POST", `${this.uploadUrl(id)}/complete`) as { data: StorageObject }).data;
+  }
+
+  async abortUpload(id: string): Promise<void> {
+    await this.client.requestStorage("DELETE", this.uploadUrl(id));
+  }
+
+  /** Resume from a server-confirmed offset. Chunk retries are idempotent. */
+  async resumeUpload(id: string, file: Pick<Blob, "size" | "slice">): Promise<StorageObject> {
+    const session = await this.uploadStatus(id);
+    if (session.size !== file.size || !Number.isSafeInteger(session.offset) || session.offset < 0 || session.offset > file.size
+        || !Number.isSafeInteger(session.chunk_size) || session.chunk_size < 1 || session.chunk_size > 8 * 1024 * 1024) {
+      throw new Error("Invalid upload session or mismatched file size");
+    }
+    const retry = async <T>(operation: () => Promise<T>): Promise<T> => {
+      for (let attempt = 0; ; attempt++) {
+        try { return await operation(); } catch (error) {
+          if (attempt >= 2 || (error instanceof LoomupError && error.status !== undefined && error.status > 0 && error.status < 500 && error.status !== 429)) throw error;
+          await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
+        }
+      }
+    };
+    for (let offset = session.offset; offset < file.size;) {
+      const end = Math.min(offset + session.chunk_size, file.size);
+      const chunk = file.slice(offset, end);
+      const result = await retry(() => this.uploadChunk(id, offset, chunk));
+      if (result.offset !== end) throw new Error("Unexpected upload offset");
+      offset = end;
+    }
+    return retry(() => this.completeUpload(id));
+  }
+
   /** Upload raw bytes / Blob / File / Buffer / string. Returns object metadata. */
   async upload(
     path: string,
     body: StorageUploadBody,
     options?: StorageUploadOptions,
   ): Promise<StorageObject> {
+    const size = body instanceof Blob ? body.size : typeof body === "string" ? new TextEncoder().encode(body).byteLength : body.byteLength;
+    if (size > 8 * 1024 * 1024) {
+      const bytes = body instanceof Blob ? undefined : typeof body === "string" ? new TextEncoder().encode(body)
+        : body instanceof ArrayBuffer ? new Uint8Array(body) : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+      const file = body instanceof Blob ? body : { size, slice: (start = 0, end = size) => new Blob([new Uint8Array(bytes!.subarray(start, end))]) };
+      const contentType = options?.contentType ?? (body instanceof Blob ? body.type || "application/octet-stream"
+        : typeof body === "string" ? "text/plain; charset=utf-8" : "application/octet-stream");
+      const session = await this.createUpload(path, size, { ...options, contentType });
+      try { return await this.resumeUpload(session.id, file); }
+      catch (error) { await this.abortUpload(session.id).catch(() => undefined); throw error; }
+    }
     const normalized = normalizeStorageUpload(body, options);
     const headers: Record<string, string> = {};
     if (normalized.contentType) {

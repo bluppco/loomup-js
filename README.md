@@ -50,3 +50,17 @@ after a package's initial bootstrap release.
 ## License
 
 MIT
+
+## Large storage uploads
+
+Client 0.1.22 automatically uses the resumable storage protocol for files above
+8 MiB. Deploy a backend supporting `/storage/v1/{bucket}/uploads` first and set
+the project's object-size and storage quotas appropriately. Browser File/Blob
+uploads are sliced without loading the complete file. Chunk and completion
+requests retry transient failures; terminal failures abort the session.
+
+For explicit resume, retain the ID from `createUpload(path, size, options)`, then
+call `resumeUpload(id, originalBlob)` with the same file. `uploadStatus`,
+`uploadChunk`, `completeUpload`, and `abortUpload` expose each protocol step.
+The server binds sessions to their owner, expires them after 24 hours, and
+checks the final byte count before making an object available.

@@ -1,6 +1,6 @@
 {
   "name": "@loomup/react-native",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "React Native helpers for Loomup Realtime (AsyncStorage session + hooks)",
   "type": "module",
   "main": "dist/index.js",
