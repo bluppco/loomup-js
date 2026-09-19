@@ -43,6 +43,8 @@ export type WorkspaceProjectAccess<TTables = Record<string, unknown>> = {
   publicWorkspaces?: boolean;
   /** Use owner/editor/viewer project-member roles. Requires project_members.role and workspace_id. */
   projectRoles?: boolean;
+  /** Hide deleted projects and all related content. Requires projects.deleted_at: datetime?. */
+  projectSoftDelete?: boolean;
   /** Project roots whose published records can be read through public/audience rules. */
   publishedContent?: readonly PublishedContentDefinition<TableName<TTables>>[];
   /** Project roots that always require an authenticated workspace member. */
@@ -77,6 +79,8 @@ export type WorkspaceProjectAccess<TTables = Record<string, unknown>> = {
     table: TableName<TTables>;
     /** Defaults to `r2_key`. */
     pathField?: string;
+    /** Explicit project ID field for soft-delete checks on service-only retained metadata without a foreign key. */
+    projectField?: string;
   }[];
 };
 

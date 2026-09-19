@@ -39,6 +39,7 @@ type WorkspaceProjectConfig = {
   };
   publicWorkspaces?: boolean;
   projectRoles?: boolean;
+  projectSoftDelete?: boolean;
   publishedContent?: PublishedContent[];
   memberContent?: string[];
   comments?: string[];
@@ -47,7 +48,7 @@ type WorkspaceProjectConfig = {
   issueParents?: Array<{ table: string; field: string }>;
   ownedUploads?: string[];
   serviceOnly?: string[];
-  objects?: Array<{ table: string; pathField?: string }>;
+  objects?: Array<{ table: string; pathField?: string; projectField?: string }>;
 };
 
 type ServerMediatedConfig = {
@@ -60,7 +61,7 @@ type ServerMediatedConfig = {
 };
 
 type AccessConfig = { profile: "authenticated" } | WorkspaceProjectConfig | ServerMediatedConfig;
-type SchemaTable = { fields: Map<string, string | undefined> };
+type SchemaTable = { fields: Map<string, string | undefined>; nullableDatetimes: Set<string>; uniqueFields: Set<string> };
 type SchemaShape = { tables: Map<string, SchemaTable>; buckets: string[] };
 
 const primitiveTypes = new Set([
@@ -114,6 +115,7 @@ function parseSchema(source: string): SchemaShape {
     if (tableName.startsWith("$")) continue;
     const table = object(rawTable, `schema table ${tableName}`);
     const fields = new Map<string, string | undefined>();
+    const nullableDatetimes = new Set<string>();
     for (const [fieldName, rawField] of Object.entries(table)) {
       if (fieldName.startsWith("$")) continue;
       let token: unknown = rawField;
@@ -122,11 +124,19 @@ function parseSchema(source: string): SchemaShape {
         token = definition.type ?? (Array.isArray(definition.enum) ? "text" : undefined);
       }
       if (typeof token !== "string") continue;
+      if (token === "datetime?") nullableDatetimes.add(fieldName);
       const normalized = token.replace(/\?$/, "");
       fields.set(fieldName, primitiveTypes.has(normalized) ? undefined : normalized);
     }
     if (!fields.has("id")) fields.set("id", undefined);
-    tables.set(tableName, { fields });
+    const uniqueFields = new Set<string>();
+    if (Array.isArray(table.$indexes)) for (const index of table.$indexes) {
+      if (!index || typeof index !== "object") continue;
+      const unique = (index as Record<string, unknown>).unique;
+      if (typeof unique === "string") uniqueFields.add(unique);
+      else if (Array.isArray(unique) && unique.length === 1 && typeof unique[0] === "string") uniqueFields.add(unique[0]);
+    }
+    tables.set(tableName, { fields, nullableDatetimes, uniqueFields });
   }
   const rawBuckets = root.$buckets;
   const buckets = rawBuckets && typeof rawBuckets === "object" && !Array.isArray(rawBuckets)
@@ -190,6 +200,7 @@ function validateConfig(value: unknown): AccessConfig {
         return {
           table: string(item.table, `objects[${index}].table`),
           pathField: item.pathField === undefined ? undefined : string(item.pathField, `objects[${index}].pathField`),
+          projectField: item.projectField === undefined ? undefined : string(item.projectField, `objects[${index}].projectField`),
         };
       });
   const notifications = config.notifications === undefined
@@ -219,6 +230,7 @@ function validateConfig(value: unknown): AccessConfig {
     },
     publicWorkspaces: config.publicWorkspaces === true,
     projectRoles: boolean(config.projectRoles, "projectRoles"),
+    projectSoftDelete: boolean(config.projectSoftDelete, "projectSoftDelete"),
     publishedContent,
     memberContent: strings(config.memberContent, "memberContent"),
     comments: strings(config.comments, "comments"),
@@ -316,6 +328,9 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
   if (config.projectRoles) {
     field(t.projectMembers, "role");
     field(t.projectMembers, "workspace_id");
+  }
+  if (config.projectSoftDelete && !table(t.projects).nullableDatetimes.has("deleted_at")) {
+    fail(`${t.projects}.deleted_at must be a nullable datetime for projectSoftDelete`);
   }
   for (const target of config.projectUserFields ?? []) {
     if (table(target.table).fields.get(target.field) !== t.users) fail(`${target.table}.${target.field} must reference ${t.users}`);
@@ -571,23 +586,56 @@ function compileWorkspaceProject(shape: SchemaShape, config: WorkspaceProjectCon
       rules.update = and(rules.update, or(and(`${parent} = null`, `${original} = null`), `${parent} = ${original}`),
         ...["workspace_id", "project_id"].map(name => `${field(tableName, name)} = lookup(${tableName}, ${name}, id = ${id})`));
     }
+    if (config.projectSoftDelete && hasPath(tableName, t.projects)) {
+      const active = `exists(${t.projects}, id = ${projectId(tableName)}, deleted_at = null)`;
+      if (tableName === t.projects) {
+        // Update checks run on both the old and proposed row before the write.
+        // Inspect persisted state to permit active -> deleted, but never restore.
+        rules = {
+          ...rules,
+          read: and(rules.read, `${field(tableName, "deleted_at")} = null`),
+          subscribe: and(rules.subscribe, `${field(tableName, "deleted_at")} = null`),
+          notify: and(rules.notify, `${field(tableName, "deleted_at")} = null`),
+          create: and(rules.create, `${field(tableName, "deleted_at")} = null`),
+          update: and(rules.update, active),
+          delete: deny,
+        };
+      } else {
+        for (const operation of Object.keys(rules) as Array<keyof AccessOperations>) {
+          if (rules[operation] !== deny) rules[operation] = and(rules[operation], active);
+        }
+      }
+    }
     compiled.tables[tableName] = rules;
   }
 
   for (const bucket of shape.buckets) {
-    const objectRules = (config.objects ?? []).map(({ table: objectTable, pathField = "r2_key" }) => {
+    const objectRules = (config.objects ?? []).map(({ table: objectTable, pathField = "r2_key", projectField }) => {
       field(objectTable, pathField);
+      const objectProject = projectField ? field(objectTable, projectField)
+        : hasPath(objectTable, t.projects) ? projectId(objectTable) : undefined;
+      if (config.projectSoftDelete && objectProject && !table(objectTable).uniqueFields.has(pathField)) {
+        fail(`${objectTable}.${pathField} requires a single-field unique index for projectSoftDelete`);
+      }
       const convert = (rule: string) => rule.replace(/row\.([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name: string) =>
         `lookup(${objectTable}, ${name}, ${pathField} = row.path)`);
       const tableRules = compiled.tables[objectTable]!;
-      return { read: convert(tableRules.read), manage: convert(tableRules.update) };
+      // Ownership still allows unclaimed uploads, but cannot bypass project
+      // deletion once a path is linked to final metadata (even by its uploader).
+      const active = config.projectSoftDelete && objectProject
+        ? or(`lookup(${objectTable}, id, ${pathField} = row.path) = null`,
+          convert(`exists(${t.projects}, id = ${objectProject}, deleted_at = null)`))
+        : "true";
+      return { read: convert(tableRules.read), manage: convert(tableRules.update), active };
     });
     const owner = "row.owner_id = auth.uid()";
+    const available = (rule: string) => config.projectSoftDelete
+      ? and(rule, ...objectRules.map(rules => rules.active)) : rule;
     compiled.buckets[bucket] = access(
-      or(owner, ...objectRules.map((rules) => rules.read)),
-      authenticated,
-      or(owner, ...objectRules.map((rules) => rules.manage)),
-      or(owner, ...objectRules.map((rules) => rules.manage)),
+      available(or(owner, ...objectRules.map((rules) => rules.read))),
+      available(authenticated),
+      available(or(owner, ...objectRules.map((rules) => rules.manage))),
+      available(or(owner, ...objectRules.map((rules) => rules.manage))),
     );
   }
   return compiled;

@@ -198,6 +198,24 @@ viewers read. Workspace owners/admins retain management access. A stale project
 grant or `created_by` never bypasses current workspace membership. Existing
 profiles without this option keep their legacy project-grant behavior.
 
+`projectSoftDelete: true` requires `projects.deleted_at: datetime?`. User sessions
+can mark an active project deleted with its existing update permission. Deleted
+projects and related content are then unavailable for reads, writes, realtime,
+and notifications, including public content and linked object paths. Ordinary
+sessions cannot restore or hard-delete projects. Unclaimed uploads keep their
+normal ownership rules. Each configured project-linked object path field needs
+a single-field unique index so one path cannot resolve to ambiguous metadata.
+For retained service-only metadata without a foreign key, set the object
+definition's `projectField` to its stored project ID field. This only adds a
+deletion check; it does not grant table access. Include staging metadata in
+`objects` when uploaded paths must become inaccessible with their project.
+This option defaults to false for compatibility.
+Successful deletion updates may return only an ID acknowledgement because the
+updated project is no longer readable. Retained records and files are not purged.
+Membership-removal guards continue to include retained assignments: authorized
+server-side member-removal workflows must clear those using a backend client
+before the user-scoped membership deletion, preserving the concurrency guard.
+
 Notification deletion defaults to denied. `allowDelete: true` permits only the
 recipient, while they still belong to the workspace and can read the project.
 It does not permit creating notifications. Use the generated table's `delete`

@@ -7,6 +7,7 @@ test("workspace access options are part of the public typed contract", () => {
   const config = {
     profile: "workspace-project",
     projectRoles: true,
+    projectSoftDelete: true,
     notifications: [{ table: "notifications", allowDelete: true }],
     projectUserFields: [{ table: "issues", field: "assignee_id", nullable: true, guardRemoval: true }],
     issueParents: [{ table: "issues", field: "parent_issue_id" }],
