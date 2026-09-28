@@ -201,7 +201,7 @@ function parseSchema(source: string): { tables: ParsedTable[]; realtimeTables: S
   const root = object(value, "schema root");
   if (!Object.keys(root).length) throw new Error("schema must declare at least one table");
 
-  const projectMetadata = new Set(["$buckets", "$policies", "$auth", "$email", "$origins", "$realtime", "$notifications", "$push", "$handles"]);
+  const projectMetadata = new Set(["$buckets", "$policies", "$auth", "$email", "$origins", "$realtime", "$notifications", "$push", "$handles", "$quotas"]);
   for (const key of Object.keys(root).filter((key) => key.startsWith("$"))) {
     if (!projectMetadata.has(key)) throw new Error(`unknown project metadata \`${key}\``);
   }

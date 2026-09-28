@@ -415,3 +415,11 @@ The `$email.templates.email_challenge` template customizes backend-only,
 account-independent email verification. It accepts the same subject, text,
 HTML, and placeholders as the auth templates. Schema generation preserves this
 metadata; Loomup validates and applies it when publishing the schema.
+
+## Workspace quota metadata
+
+`loomup generate` recognizes the backend-owned `$quotas` declaration. It remains
+in migration input and does not expose internal accounting tables in generated
+clients. Apply the backend quota implementation before migrating a declaration;
+review the migration plan and any ambiguous-object backfill errors first. See
+https://tryloomup.com/docs/storage for policy fields and rollout behavior.
