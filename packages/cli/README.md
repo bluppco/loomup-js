@@ -410,3 +410,8 @@ exception tables in `$realtime.tables` as well to enable realtime delivery.
 Review `loomup migrate --plan` before applying the policies. Service-key CRUD,
 server operations and signed artifact delivery continue to use backend access;
 never expose those keys to browsers.
+
+The `$email.templates.email_challenge` template customizes backend-only,
+account-independent email verification. It accepts the same subject, text,
+HTML, and placeholders as the auth templates. Schema generation preserves this
+metadata; Loomup validates and applies it when publishing the schema.

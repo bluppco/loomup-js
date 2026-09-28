@@ -131,6 +131,16 @@ export type ImportedIdentity = {
   email: string;
 };
 
+/** Backend-only ownership proof; does not create an account or session. */
+export type EmailVerificationInput = {
+  email: string;
+  purpose: string;
+  reference: string;
+  redirectTo: string;
+};
+export type EmailVerificationPending = { id: string; expires_at: number };
+export type EmailVerificationReceipt = { id: string; email: string; purpose: string; reference: string; verified_at: number };
+
 export type InviteUserInput = {
   email: string;
   role?: string;
@@ -913,6 +923,22 @@ export class LoomupClient<
       logout: () => this.signOut(),
       me: () => this.me(),
       refresh: () => this.refresh(),
+    };
+  }
+
+  /** Backend-only email proofs. Both methods require a project:backend key. */
+  get emailVerifications() {
+    return {
+      create: async (input: EmailVerificationInput, options: { idempotencyKey: string }): Promise<EmailVerificationPending> => {
+        const response = await this.request<{ data: EmailVerificationPending }>("POST", "/email-verifications", {
+          email: input.email, purpose: input.purpose, reference: input.reference, redirect_to: input.redirectTo,
+        }, { headers: { "Idempotency-Key": options.idempotencyKey } });
+        return response.data;
+      },
+      confirm: async (token: string): Promise<EmailVerificationReceipt> => {
+        const response = await this.request<{ data: EmailVerificationReceipt }>("POST", "/email-verifications/confirm", { token });
+        return response.data;
+      },
     };
   }
 
@@ -2880,7 +2906,7 @@ export class UsersResource {
   }
 
   /** Server-only invitation helper. Requires a `project:backend` service key. */
-  async invite(input: InviteUserInput): Promise<AuthActionResult> {
+  async invite(input: InviteUserInput, options?: CommandOptions): Promise<AuthActionResult> {
     const response = await this.client.request<{ data: AuthActionResult }>(
       "POST",
       "/auth/users/invite",
@@ -2889,6 +2915,7 @@ export class UsersResource {
         role: input.role,
         redirect_to: input.redirectTo,
       },
+      options?.idempotencyKey ? { headers: { "Idempotency-Key": options.idempotencyKey } } : undefined,
     );
     return response.data;
   }

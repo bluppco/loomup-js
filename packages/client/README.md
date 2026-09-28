@@ -226,3 +226,26 @@ exception tables in `$realtime.tables` as well to enable realtime delivery.
 Review `loomup migrate --plan` before applying the policies. Service-key CRUD,
 server operations and signed artifact delivery continue to use backend access;
 never expose those keys to browsers.
+
+## Email ownership without an account
+
+Trusted servers with a `project:backend` key can verify an address before
+creating an identity. This never issues session tokens:
+
+```ts
+await client.emailVerifications.create({
+  email: "person@example.com", purpose: "waitlist", reference: "entry-id",
+  redirectTo: "https://app.example.com/waitlist/verify",
+}, { idempotencyKey: "verification-request-id" });
+const proof = await client.emailVerifications.confirm(token);
+await client.users.invite({ email: proof.email, redirectTo: "https://app.example.com/workspaces/new" },
+  { idempotencyKey: "approval-id" });
+```
+
+The verification link carries its token in the URL fragment. Confirm it only
+following an explicit user action. Links expire after 24 hours; repeating a
+confirmation returns the same proof until expiry. SDK timestamps are Unix
+seconds. Fresh sends are limited to one per minute and five per hour per email
+and message kind; replaying the same idempotency key does not enqueue mail.
+A reused key with different input returns `idempotency_conflict` (409).
+Configure `$email.templates.email_challenge` for the verification message.
