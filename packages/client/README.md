@@ -249,3 +249,31 @@ seconds. Fresh sends are limited to one per minute and five per hour per email
 and message kind; replaying the same idempotency key does not enqueue mail.
 A reused key with different input returns `idempotency_conflict` (409).
 Configure `$email.templates.email_challenge` for the verification message.
+
+## Atomic inbox actions
+
+Use the authenticated user's `client.inbox` API to mark read or soft-delete many
+notifications in one server transaction. `scope` contains optional relation filters;
+the server always enforces recipient ownership and current access rules.
+
+```ts
+const scope = { workspace_id: workspaceId };
+const selection = await client.inbox.select(scope, userId);
+const request = {
+  action: "mark-read" as const,
+  scope,
+  expectedRecipientId: userId,
+  target: { kind: "selection" as const, selectionId: selection.selectionId, excludedIds: [] },
+  idempotencyKey: crypto.randomUUID(),
+};
+const result = await client.inbox.act(request);
+// Retry the identical request/key after an ambiguous transport failure.
+```
+
+Actions: `mark-read`, `delete`, `delete-read`. Targets: `matching`, explicit `ids`,
+or a server `selection` with optional exclusions/additions. Selection snapshots
+include unloaded pages and exclude later arrivals; query `client.inbox.members`
+for loaded-row checkboxes. Snapshots expire after 30 minutes; receipts last 24
+hours. Limits are 50,000 snapshot members and 1,000 IDs/exclusions/additions.
+The result reports `changed`, `skipped`, `cutoff`, and `changedAt`.
+See the [inbox contract](https://tryloomup.com/docs/push) for error semantics.

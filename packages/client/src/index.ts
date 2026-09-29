@@ -1,3 +1,5 @@
+import { InboxClient } from "./inbox.js";
+export * from "./inbox.js";
 /**
  * @loomup/client — TypeScript SDK for Loomup Realtime.
  */
@@ -953,6 +955,9 @@ export class LoomupClient<
       from: (bucket: string) => new FileResource(this, bucket),
     };
   }
+
+  /** Recipient-owned bulk read/delete and exact inbox selections. */
+  get inbox(): InboxClient { return new InboxClient(this); }
 
   /** Mobile push device registration (Expo / FCM / APNs tokens). */
   get push() {

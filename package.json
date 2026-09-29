@@ -1,6 +1,6 @@
 {
   "name": "loomup-js",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "private": true,
   "description": "Client SDKs and schema tooling for Loomup",
   "workspaces": [
