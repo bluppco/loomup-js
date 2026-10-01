@@ -465,6 +465,25 @@ export type LiveResourceSnapshot<TRow> = {
   meta: ListMeta;
 };
 
+export type ResourceHistoryQueryOptions<TRow = Record<string, unknown>> = {
+  /** Match any exact scalar field value on independently authorized states. */
+  anyOf: Array<{ field: Extract<keyof TRow, string>; equals: string | number | boolean | null }>;
+  beforeSequence?: number;
+  throughSequence?: number;
+  limit?: number;
+};
+
+export type ResourceHistoryQueryResult<TRow> = {
+  data: ResourceHistoryEntry<TRow>[];
+  meta: {
+    limit: number;
+    through_sequence: number;
+    retained_from_sequence: number | null;
+    /** Empty data may continue; only null means the scan is exhausted. */
+    next_before_sequence: number | null;
+  };
+};
+
 export type ResourceHistoryOptions = {
   /** Return events before this exclusive journal sequence (cursor pagination). */
   beforeSequence?: number;
@@ -2478,6 +2497,29 @@ export class TableQuery<
     return res.data;
   }
 
+  async queryHistory(options: ResourceHistoryQueryOptions<TRow>): Promise<ResourceHistoryQueryResult<TRow>> {
+    if (!Array.isArray(options.anyOf) || options.anyOf.length < 1 || options.anyOf.length > 8) {
+      throw new Error("Provide between 1 and 8 history predicates.");
+    }
+    if (options.anyOf.some(predicate => !predicate || typeof predicate.field !== "string" || !predicate.field
+      || !(predicate.equals === null || ["string", "boolean"].includes(typeof predicate.equals)
+        || (typeof predicate.equals === "number" && Number.isFinite(predicate.equals))))) {
+      throw new Error("History predicates require a field and scalar equality value.");
+    }
+    if (options.limit != null && (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 500)
+      || options.beforeSequence != null && (!Number.isSafeInteger(options.beforeSequence) || options.beforeSequence < 1)
+      || options.throughSequence != null && (!Number.isSafeInteger(options.throughSequence) || options.throughSequence < 0)) {
+      throw new Error("Invalid history pagination.");
+    }
+    return this.client.request<ResourceHistoryQueryResult<TRow>>("POST",
+      `/api/${encodeURIComponent(this.table)}/_loomup/history`, {
+        any_of: options.anyOf,
+        ...(options.beforeSequence == null ? {} : { before_sequence: options.beforeSequence }),
+        ...(options.throughSequence == null ? {} : { through_sequence: options.throughSequence }),
+        ...(options.limit == null ? {} : { limit: options.limit }),
+      });
+  }
+
   async history(
     id: string | number,
     options?: ResourceHistoryOptions,
@@ -2588,6 +2630,10 @@ export class Resource<
   /** Delete a row. `remove` remains as a backwards-compatible alias. */
   delete(id: RecordKey): Promise<TRow> {
     return this.query.delete(id);
+  }
+
+  queryHistory(options: ResourceHistoryQueryOptions<TRow>): Promise<ResourceHistoryQueryResult<TRow>> {
+    return this.query.queryHistory(options);
   }
 
   history(

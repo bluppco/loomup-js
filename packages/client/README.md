@@ -277,3 +277,28 @@ for loaded-row checkboxes. Snapshots expire after 30 minutes; receipts last 24
 hours. Limits are 50,000 snapshot members and 1,000 IDs/exclusions/additions.
 The result reports `changed`, `skipped`, `cutoff`, and `changedAt`.
 See the [inbox contract](https://tryloomup.com/docs/push) for error semantics.
+
+
+## Query retained history
+
+`resource(...).queryHistory()` and `from(...).queryHistory()` find retained
+historical rows by field values, including removed rows whose IDs are unknown.
+
+```ts
+const options = { anyOf: [{ field: "issue_id", equals: issueId }], limit: 50 };
+const page = await client.resource("issue_label_assignments").queryHistory(options);
+if (page.meta.next_before_sequence !== null) {
+  const next = await client.resource("issue_label_assignments").queryHistory({
+    ...options, throughSequence: page.meta.through_sequence,
+    beforeSequence: page.meta.next_before_sequence,
+  });
+}
+```
+
+Use one to eight scalar equality predicates on existing fields. Each historical
+state is authorized under current policy before matching. A redacted UPDATE
+remains UPDATE. Calls scan at most 2000 global journal events; an empty data page
+can continue, so stop only at null `next_before_sequence`. Keep predicates and
+the inclusive `through_sequence` fixed across pages. Metadata also reports the
+earliest retained sequence. This read neither advances consumers nor sends
+notifications. See [resource contracts](https://tryloomup.com/docs/resources).

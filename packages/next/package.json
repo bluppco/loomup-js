@@ -1,6 +1,6 @@
 {
   "name": "@loomup/next",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "Next.js helpers for Loomup (cookie sessions, App Router, Pages Router, middleware)",
   "type": "module",
   "main": "dist/index.js",
